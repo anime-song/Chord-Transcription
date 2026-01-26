@@ -55,7 +55,7 @@ class AudioTranscriber:
         self.device = torch.device(device)
         self.model = build_model_from_config(self.config, use_segment_model=use_segment_model).to(self.device)
 
-        if checkpoint_path:
+        if checkpoint_path and not crf_checkpoint_path:
             self._load_checkpoint(self.model, checkpoint_path)
 
         self.use_crf = False

@@ -154,6 +154,6 @@ uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segme
 ### Inference with CRF
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --crf_checkpoint <crf_model.pt> --audio <audio_path> --use_segment_model
+uv run python -m src.inference --config ./configs/train.yaml --crf_checkpoint <crf_model.pt> --audio <audio_path> --use_segment_model
 
 ```

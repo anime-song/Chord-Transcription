@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Tuple
 import matplotlib
 import numpy as np
 import torch
+import sys
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -191,7 +192,7 @@ def main():
     """引数を解析し、推論処理を実行するメイン関数。"""
     parser = argparse.ArgumentParser(description="音声からコード進行とキーをTSV形式で推論・保存するスクリプト")
     parser.add_argument("--config", type=str, required=True, help="モデル設定ファイル(YAML/JSON)へのパス")
-    parser.add_argument("--checkpoint", type=str, required=True, help="学習済みモデルのチェックポイントへのパス")
+    parser.add_argument("--checkpoint", type=str, default=None, help="学習済みモデルのチェックポイントへのパス")
     parser.add_argument(
         "--crf_checkpoint", type=str, default=None, help="CRFモデルのチェックポイントへのパス (Optional)"
     )
@@ -212,6 +213,11 @@ def main():
     )
     parser.add_argument("--use_segment_model", action="store_true")
     args = parser.parse_args()
+
+    if args.checkpoint is None and args.crf_checkpoint is None:
+        print("\n[ERROR] 推論には checkpoint または crf_checkpoint の少なくとも一方が必要です。")
+        print("プログラムを終了します。")
+        sys.exit(1)
 
     try:
         # セットアップ
