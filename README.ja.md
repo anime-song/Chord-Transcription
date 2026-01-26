@@ -1,6 +1,8 @@
 # Chord-Transcription
 [English](README.md) | **日本語**
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/Chord-Transcription/blob/main/Chord_Transcription.ipynb)
+
 コード採譜モデルを学習するリポジトリ。
 
 SegmentModelによる文脈解釈で高精度な推論が可能です。

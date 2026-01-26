@@ -2,6 +2,8 @@
 
 **English** | [日本語](README.ja.md)
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/Chord-Transcription/blob/main/Chord_Transcription.ipynb)
+
 A repository for training chord transcription models.
 It enables high-precision inference through context interpretation using a **SegmentModel**.
 
