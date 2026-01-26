@@ -159,3 +159,7 @@ uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segme
 uv run python -m src.inference --config ./configs/train.yaml --crf_checkpoint <crf_model.pt> --audio <audio_path> --use_segment_model
 
 ```
+
+# Pre-trained Models
+
+Available for download [here](https://huggingface.co/anime-song/Chord-Transcription/tree/main).
