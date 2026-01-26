@@ -1,0 +1,122 @@
+experiment:
+  name: chord_transcription_v1
+  seed: 42
+  device: "cuda"
+
+data:
+  train_jsonl_path: "data/pairs.train.jsonl"
+  valid_jsonl_path: "data/pairs.validation.jsonl"
+  quality_json_path: "data/quality.json"
+  quality_class_count_path: "data/quality_freq_count.json"
+  structure_json_path: "data/music_structures.json"
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+
+data_loader:
+  sample_rate: 22050
+  hop_length: 512
+  num_workers: 3
+  prefetch_factor: 4
+  mixdown_to_mono: false
+  naming_mode: "auto"         # "auto" | "plain" | "prefixed"
+  stem_order: ["vocals", "drums", "bass", "other", "piano", "guitar"]
+  pin_memory: false
+  drop_last: false
+
+  pitch_augmentation:
+    enabled: true
+    semitone_range: [-6, 5] # -6から+5半音の範囲でランダムにシフト
+    p: 0.5
+
+  stem_augmentation:
+    enabled: true
+    dropout:
+      p: 0.5  # 50%の確率でステム・ドロップアウトを適用
+      min_stems: 2
+
+    mixing:
+      p: 0.5  # 50%の確率でランダム・ゲインを適用
+      min_gain_db: -6.0 # 各ステムのゲインを -6dB から
+      max_gain_db: 3.0  # +3dB の範囲でランダムに変更
+
+model:
+  backbone:
+    sampling_rate: 22050
+    hop_length: 512
+    n_fft: 2048
+    hidden_size: 64
+    num_layers: 6
+    dropout: 0.1
+    # 精度向上にかなり寄与するが、強度が強すぎると学習が停滞する
+    spec_augment_params:
+        freq_mask_param: 15
+        time_mask_param: 40
+        num_freq_masks: 1
+        num_time_masks: 2
+        p: 0.5
+  classifier:
+    hidden_size: 512              # BaseTranscriptionModel の H
+    dropout_probability: 0.1
+    use_layer_norm: true
+    num_tempo_classes: null       # null なら回帰（BPM）。整数なら分類クラス数。
+
+  # ルート/ベース/キー/クオリティ/セクションのクラス数
+  num_root_classes: 13
+  num_bass_classes: 13
+  num_quality_classes: 63
+  num_key_classes: 13
+
+  segment:
+    hidden_size: 256
+    num_heads: 8
+    num_layers: 6
+
+base_model_training:
+  epochs: 500
+  segment_seconds: 60.0
+  batch_size: 4
+  grad_accum_steps: 4
+  amp: false
+  grad_clip_norm: null
+  log_every_n_steps: 50
+  model_save_every_n_epochs: 5
+  validate_every_n_epochs: 5
+
+  optimizer:
+    type: "adamw"
+    lr: 5.0e-4
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: "cosine"                   # "none" | "cosine" | "step"
+    cosine_tmax: 500                # cosine 用
+    step_size: 20                  # step 用
+    gamma: 0.5
+
+  loss:
+    ce_ignore_index: -100
+    boundary_pos_weight: 5.0       # ShiftTolerantBCELoss の positive weight（不均衡なら>1）
+    boundary_tolerance: 1         # ShiftTolerantBCELoss の許容シフト幅
+    structure_boundary_pos_weight: 60.0
+    structure_boundary_tolerance: 1
+    balanced_softmax_tau: 0.1
+    focal_tversky:
+      alpha: 0.3                    # Tversky index の alpha
+      gamma: 1.5                   # Focal Tversky Loss の gamma
+
+    weights:
+      quality: 0.1
+      root_chord: 0.1
+      bass: 0.1
+      key: 0.1
+      boundary: 3.0
+      tempo: 0.1
+      chord25: 10.0
+      smooth_chord25: 10.0
+
+crf_training:
+  epochs: 100
+  batch_size: 2
+  segment_seconds: 30.0
+  lr: 1.0e-3
