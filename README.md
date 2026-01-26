@@ -1,6 +1,6 @@
 # Chord-Transcription
 
-**English** | [日本語](https://www.google.com/search?q=README.ja.md)
+**English** | [日本語](README.ja.md)
 
 A repository for training chord transcription models.
 It enables high-precision inference through context interpretation using a **SegmentModel**.
