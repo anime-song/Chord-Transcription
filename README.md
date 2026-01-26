@@ -79,3 +79,47 @@ uv run python -m src.preprocess.count_quality_freq --data_folder <data_folder> -
       * **Default**: `./data/quality_freq_count.json`
 
 -----
+
+
+# 学習
+### Step 1. 1段目のモデル学習
+
+```bash
+uv run python -m src.train_transcription --config ./configs/train.yaml
+```
+
+### Step 2. 2段目のモデル学習
+
+checkpointには1段目のモデルの重みを指定します。
+
+```bash
+uv run python -m src.train_segment_transcription --config ./configs/train.yaml --checkpoint <base_transcription.pt> --training_backbone
+```
+
+### Step 3. CRFの学習
+
+checkpointには2段目のモデルの重みを指定します。
+
+```bash
+uv run python -m src.train_crf --config ./configs/train.yaml --checkpoint <segment_model.pt>
+```
+
+# 推論
+
+### 1段目のモデルで推論する場合
+
+```bash
+uv run python -m src.inference --config ./configs/train.yaml --checkpoint <base_transcription.pt> --audio <audio_path>
+```
+
+### 2段目のモデルで推論する場合
+
+```bash
+uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --audio <audio_path> --use_segment_model
+```
+
+### CRFで推論する場合
+
+```bash
+uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --crf_checkpoint <crf_model.pt> --audio <audio_path> --use_segment_model
+```
