@@ -70,6 +70,12 @@ model:
     hidden_size: 256
     num_heads: 8
     num_layers: 6
+    segment_augment_params:
+      time_mask_ratio: 0.25
+      time_mask_width: 1
+      feature_mask_ratio: 0.0
+      feature_mask_width: 1
+      prob: 0.5
 
 base_model_training:
   epochs: 500
@@ -100,13 +106,12 @@ base_model_training:
     boundary_tolerance: 1         # ShiftTolerantBCELoss の許容シフト幅
     structure_boundary_pos_weight: 60.0
     structure_boundary_tolerance: 1
-    balanced_softmax_tau: 0.1
+    balanced_softmax_tau: 0.3
     focal_tversky:
       alpha: 0.3                    # Tversky index の alpha
       gamma: 1.5                   # Focal Tversky Loss の gamma
 
     weights:
-      quality: 0.1
       root_chord: 0.1
       bass: 0.1
       key: 0.1

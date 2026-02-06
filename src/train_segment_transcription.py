@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--config", required=True, help="Path to the training configuration YAML file.")
     parser.add_argument(
         "--checkpoint",
-        required=True,
+        default=None,
         help="Pretrained base model checkpoint to initialize the backbone (loaded backbone-only).",
     )
     parser.add_argument("--resume", default=None, help="Optional checkpoint to resume segment training from.")
@@ -72,7 +72,7 @@ def main():
 
     if args.resume:
         trainer.load_checkpoint(args.resume, strict=False, resume_epoch=args.resume_epoch)
-    else:
+    elif args.checkpoint is not None:
         trainer.load_checkpoint(args.checkpoint, strict=False, resume_epoch=1, load_backbone_only=True)
 
     print("Starting segment model training...")

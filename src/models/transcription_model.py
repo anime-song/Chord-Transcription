@@ -403,6 +403,7 @@ class BaseTranscriptionModel(nn.Module):
         self.chord25_head = nn.Sequential(nn.Linear(hidden_size, chord25_hidden))
         self.boundary_head = nn.Linear(hidden_size, 1)
         self.key_head = nn.Linear(hidden_size, num_key_classes)
+        self.bass_head = nn.Linear(hidden_size, num_bass_classes)
 
         if num_tempo_classes is None:
             self.tempo_head = nn.Linear(hidden_size, 1)
@@ -429,9 +430,11 @@ class BaseTranscriptionModel(nn.Module):
 
         self.smooth_head = nn.Sequential(nn.Linear(smooth_hidden, chord25_hidden))
         self.root_chord_head = nn.Linear(chord25_hidden, self.num_root_quality_classes)
-        self.bass_head = nn.Linear(chord25_hidden, num_bass_classes)
 
     def _compute_heads_and_answer(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
+        checkpoint_fn = (
+            torch.utils.checkpoint.checkpoint if self.training and torch.is_grad_enabled() else checkpoint_bypass
+        )
         normed = self.norm(features)  # RMSNorm or Identity
         features = self.dropout(normed)
 
@@ -445,6 +448,7 @@ class BaseTranscriptionModel(nn.Module):
             "initial_key_logits": self.key_head(features),
             "initial_tempo": self.tempo_head(features),
             "initial_boundary_logits": self.boundary_head(features),
+            "initial_bass_logits": self.bass_head(features),
         }
 
         # Smooth Branch
@@ -457,7 +461,7 @@ class BaseTranscriptionModel(nn.Module):
         # 2. RNN
         skip = x
         self.smooth_rnn.flatten_parameters()
-        x, _ = self.smooth_rnn(x)  # (B, T, 256)
+        x, _ = checkpoint_fn(self.smooth_rnn, x, use_reentrant=True)  # (B, T, 256)
         x = torch.concat([skip, x], dim=-1)
 
         # 3. Stage 2 (Dense ReLU)
@@ -471,7 +475,6 @@ class BaseTranscriptionModel(nn.Module):
 
         # Root Chord from Smooth Features
         outputs["initial_root_chord_logits"] = self.root_chord_head(smooth_features)
-        outputs["initial_bass_logits"] = self.bass_head(smooth_features)
 
         # Smooth Chord25 Logits (for loss calculation)
         outputs["initial_smooth_chord25_logits"] = smooth_features[..., :25]

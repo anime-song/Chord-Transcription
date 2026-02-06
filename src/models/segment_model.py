@@ -2,7 +2,8 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.utils.checkpoint
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Union
+import random
 
 
 from .transformer import RMSNorm, Transformer
@@ -12,6 +13,76 @@ from .transcription_model import Backbone
 def checkpoint_bypass(func, *args, **kwargs):
     """チェックポイントを使用しない場合のバイパス関数"""
     return func(*args)
+
+
+class SegmentAugment(nn.Module):
+    """
+    セグメント特徴量 (B, T, D) に対するマスク処理。
+    指定された割合(Ratio)と幅(Span Width)に基づいてマスクを適用します。
+    学習時(model.train())のみ適用されます。
+    """
+
+    def __init__(
+        self,
+        time_mask_ratio: float = 0.0,
+        time_mask_width: int = 1,
+        feature_mask_ratio: float = 0.0,
+        feature_mask_width: int = 1,
+        prob: float = 1.0,
+    ):
+        """
+        Args:
+            time_mask_ratio (float): 時間軸をマスクする割合 (0.0 ~ 1.0)
+            time_mask_width (int): 時間軸マスクの1ブロックあたりの長さ (Span)
+            feature_mask_ratio (float): 特徴量軸をマスクする割合 (0.0 ~ 1.0)
+            feature_mask_width (int): 特徴量軸マスクの1ブロックあたりの長さ (Span)
+            prob (float): Augmentationを適用する確率
+        """
+        super().__init__()
+        self.time_mask_ratio = time_mask_ratio
+        self.time_mask_width = time_mask_width
+        self.feature_mask_ratio = feature_mask_ratio
+        self.feature_mask_width = feature_mask_width
+        self.prob = prob
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x (torch.Tensor): (B, T, D)
+        Returns:
+            x_aug (torch.Tensor): Masked tensor
+            mask (torch.Tensor): Boolean mask (True where masked), shape (B, T, D)
+        """
+        if not self.training or random.random() > self.prob:
+            # マスクなし（全てFalse）
+            return x, torch.zeros_like(x, dtype=torch.bool)
+
+        B, T, D = x.shape
+        x_aug = x.clone()
+        mask = torch.zeros_like(x, dtype=torch.bool)
+
+        for i in range(B):
+            # Time Masking
+            if self.time_mask_ratio > 0 and self.time_mask_width > 0:
+                num_time_masked_units = int(T * self.time_mask_ratio)
+                num_time_masks = num_time_masked_units // self.time_mask_width
+
+                for _ in range(num_time_masks):
+                    t_start = random.randint(0, max(0, T - self.time_mask_width))
+                    x_aug[i, t_start : t_start + self.time_mask_width, :] = 0
+                    mask[i, t_start : t_start + self.time_mask_width, :] = True
+
+            # Feature Masking
+            if self.feature_mask_ratio > 0 and self.feature_mask_width > 0:
+                num_feature_masked_units = int(D * self.feature_mask_ratio)
+                num_feature_masks = num_feature_masked_units // self.feature_mask_width
+
+                for _ in range(num_feature_masks):
+                    f_start = random.randint(0, max(0, D - self.feature_mask_width))
+                    x_aug[i, :, f_start : f_start + self.feature_mask_width] = 0
+                    mask[i, :, f_start : f_start + self.feature_mask_width] = True
+
+        return x_aug, mask
 
 
 class SegmentFeatureProcessor:
@@ -296,6 +367,7 @@ class SegmentTranscriptionModel(nn.Module):
         transformer_hidden_size: int = 256,
         transformer_num_heads: int = 8,
         transformer_num_layers: int = 3,
+        segment_augment_params: Optional[Dict[str, Union[int, float]]] = None,
     ) -> None:
         super().__init__()
         self.backbone = backbone
@@ -310,6 +382,7 @@ class SegmentTranscriptionModel(nn.Module):
         self.num_bass_classes = num_bass_classes
 
         # Main Branch Heads (backbone特徴量から予測)
+        self.chord25_head = nn.Linear(hidden_size, 25)
         self.boundary_head = nn.Linear(hidden_size, 1)
 
         if num_tempo_classes is None:
@@ -321,8 +394,15 @@ class SegmentTranscriptionModel(nn.Module):
 
         # --- Segment Branch ---
         self.segmenter = BatchBoundarySegmenter(
-            threshold=0.5, nms_window_radius=3, min_segment_length=8, max_segments=256
+            threshold=0.5, nms_window_radius=3, min_segment_length=4, max_segments=256
         )
+
+        # Segment Augmentation
+        if segment_augment_params is not None:
+            self.segment_augment = SegmentAugment(**segment_augment_params)
+        else:
+            self.segment_augment = None
+
         self.seg_transformer = Transformer(
             input_dim=hidden_size,
             head_dim=transformer_hidden_size // transformer_num_heads,
@@ -360,7 +440,7 @@ class SegmentTranscriptionModel(nn.Module):
         # (B, T, 1)
         current_pos = pos_aligned.unsqueeze(-1)
         # (1, 1, S)
-        target_idx = torch.arange(max_segments, device=device).view(1, 1, -1)
+        target_idx = torch.arange(max_segments, device=device, dtype=pos_aligned.dtype).view(1, 1, -1)
 
         # 距離の二乗 (B, T, S)
         dist_sq = (current_pos - target_idx) ** 2
@@ -386,9 +466,13 @@ class SegmentTranscriptionModel(nn.Module):
         features = self.dropout(normed)
 
         boundary_logits = self.boundary_head(features)
+        chord25 = self.chord25_head(features)
+        chord25 = torch.clamp(torch.relu(chord25), max=1.0)
         outputs = {
             "initial_tempo": self.tempo_head(features),
             "initial_boundary_logits": boundary_logits,
+            "initial_chord25_logits": chord25[..., :25],
+            "initial_chord25_original": chord25,
         }
 
         seg_pad, seg_mask, seg_ids, segments = self.segmenter.process_batch(
@@ -396,6 +480,12 @@ class SegmentTranscriptionModel(nn.Module):
         )
 
         x = seg_pad * seg_mask.unsqueeze(-1).to(seg_pad.dtype)
+
+        # Apply Segment Augmentation (Training only)
+        seg_aug_mask = None
+        if self.segment_augment is not None and self.training:
+            x, seg_aug_mask = self.segment_augment(x)
+
         x = checkpoint_fn(self.seg_transformer, x, use_reentrant=False)
         x = self.seg_out_proj(x)
 
@@ -403,6 +493,12 @@ class SegmentTranscriptionModel(nn.Module):
             frame_ctx = self._ste_broadcast(x, seg_ids, boundary_logits)
         else:
             frame_ctx = self.segmenter.expand_to_frames(x, seg_ids)
+
+        if seg_aug_mask is not None:
+            # マスクをフレームレベルに拡張
+            frame_aug_mask = self.segmenter.expand_to_frames(seg_aug_mask.float(), seg_ids) > 0.5
+            # 特徴量もマスクする
+            features = features * (~frame_aug_mask)
 
         refined_features = features + frame_ctx
 
@@ -426,9 +522,7 @@ class SegmentTranscriptionModel(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         self.segmenter.set_max_segments(max_segments)
 
-        # Backbone Feature Extraction
         features = self.backbone(waveform)
-
-        # Heads & Segment Logic
         outputs = self._compute_heads_and_answer(features)
+
         return outputs

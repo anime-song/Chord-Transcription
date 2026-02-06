@@ -211,6 +211,7 @@ def build_model_from_config(
             transformer_hidden_size=seg_conf["hidden_size"],
             transformer_num_heads=seg_conf["num_heads"],
             transformer_num_layers=seg_conf["num_layers"],
+            segment_augment_params=seg_conf.get("segment_augment_params", {}),
         )
     return BaseTranscriptionModel(**common_kwargs)
 

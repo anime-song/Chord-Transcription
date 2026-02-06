@@ -108,7 +108,11 @@ class Trainer:
         filtered = {}
         skipped = []
         for k, v in incoming_state.items():
-            if k in target_state and target_state[k].shape == v.shape and ("backbone" in k or "boundary_head" in k):
+            if (
+                k in target_state
+                and target_state[k].shape == v.shape
+                and ("backbone" in k or "boundary_head" in k)
+            ):
                 filtered[k] = v
             else:
                 skipped.append(k)
