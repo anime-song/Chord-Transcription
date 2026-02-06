@@ -17,11 +17,85 @@ from .utils import (
 from .models.crf_wrapper import TranscriptionCRFModel
 
 
+import numpy as np
+
+
+def calculate_accuracy(preds_list, labels, mask):
+    correct = 0
+    total = 0
+    mask = mask.bool().cpu()
+    labels = labels.cpu()
+
+    for b, pred_seq in enumerate(preds_list):
+        valid_len = int(mask[b].sum().item())
+
+        p = np.array(pred_seq[:valid_len])
+        l = labels[b][:valid_len].numpy()
+
+        correct += np.sum(p == l)
+        total += valid_len
+    return correct, total
+
+
+def val_loop(model, loader, device):
+    model.eval()
+    total_loss = 0.0
+    count = 0
+
+    metrics = {"root_correct": 0, "root_total": 0, "bass_correct": 0, "bass_total": 0, "key_correct": 0, "key_total": 0}
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Validation"):
+            waveform = batch["audio"].to(device)
+            root_labels = batch["root_chord_index"].to(device)
+            bass_labels = batch["bass_index"].to(device)
+            key_labels = batch["key_index"].to(device)
+
+            mask = (root_labels != -100).byte()
+
+            loss, preds = model.get_loss_and_preds(
+                waveform,
+                root_labels=root_labels.clone(),
+                bass_labels=bass_labels.clone(),
+                key_labels=key_labels.clone(),
+                mask=mask,
+            )
+
+            total_loss += loss.item()
+            count += 1
+
+            # Accuracy
+            r_corr, r_tot = calculate_accuracy(preds["root"], root_labels, mask)
+            b_corr, b_tot = calculate_accuracy(preds["bass"], bass_labels, mask)
+            k_corr, k_tot = calculate_accuracy(preds["key"], key_labels, mask)
+
+            metrics["root_correct"] += r_corr
+            metrics["root_total"] += r_tot
+            metrics["bass_correct"] += b_corr
+            metrics["bass_total"] += b_tot
+            metrics["key_correct"] += k_corr
+            metrics["key_total"] += k_tot
+
+    avg_loss = total_loss / count if count > 0 else 0.0
+
+    out_metrics = {"loss": avg_loss}
+    out_metrics["root_acc"] = metrics["root_correct"] / metrics["root_total"] if metrics["root_total"] > 0 else 0.0
+    out_metrics["bass_acc"] = metrics["bass_correct"] / metrics["bass_total"] if metrics["bass_total"] > 0 else 0.0
+    out_metrics["key_acc"] = metrics["key_correct"] / metrics["key_total"] if metrics["key_total"] > 0 else 0.0
+
+    return out_metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description="凍結したTranscriptionModel上でCRF層(Root, Bass, Key)を学習します")
     parser.add_argument("--config", required=True, help="学習設定YAMLファイルへのパス")
     parser.add_argument("--checkpoint", required=True, help="学習済みBaseTranscriptionModelチェックポイントへのパス")
     parser.add_argument("--output_dir", default="checkpoints_crf", help="CRFチェックポイントの保存先ディレクトリ")
+    parser.add_argument(
+        "--use_segment_model",
+        action="store_true",
+        help="SegmentTranscriptionModelを使用するかどうか (デフォルト: False)",
+    )
 
     args = parser.parse_args()
 
@@ -33,7 +107,6 @@ def main():
     print(f"使用デバイス: {device}")
 
     # DataLoaderの構築
-    # 'crf_training' がなければ 'base_model_training' の設定を使用します
     train_cfg_key = "crf_training"
     if train_cfg_key not in config:
         print(f"警告: 設定に '{train_cfg_key}' が見つかりません。デフォルト値を使用します。")
@@ -46,7 +119,6 @@ def main():
     else:
         crf_config = config[train_cfg_key]
 
-    # DataLoaderのパラメータを一貫させる
     phase_config = {
         "batch_size": crf_config.get("batch_size", 4),
         "segment_seconds": crf_config.get("segment_seconds", 60.0),
@@ -55,14 +127,8 @@ def main():
     label_processor = build_label_processor(config)
     train_loader, valid_loader = build_dataloaders(config, label_processor, phase_config=phase_config)
 
-    # train_loaderとvalid_loaderの両方を学習に使用する
-    import itertools
-
-    combined_loader = itertools.chain(train_loader, valid_loader)
-    total_batches = len(train_loader) + len(valid_loader)
-
     # Base Modelの構築と読み込み
-    base_model = build_model_from_config(config, use_segment_model=True).to(device)
+    base_model = build_model_from_config(config, use_segment_model=args.use_segment_model).to(device)
     load_base_model_checkpoint(base_model, args.checkpoint, device)
 
     # CRFモデルでラップ
@@ -85,40 +151,22 @@ def main():
     print("CRF (Root, Bass, Key) の学習を開始します...")
 
     for epoch in range(1, epochs + 1):
+        # Training Loop
         model.train()
         total_loss = 0.0
         count = 0
 
-        # itertools.chainは再利用できないため、エポックごとに再生成する必要があります
-        combined_loader = itertools.chain(train_loader, valid_loader)
-        progress = tqdm(combined_loader, total=total_batches, desc=f"Epoch {epoch}/{epochs}")
+        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]")
         for batch in progress:
-            # batch keys: audio, root_chord_index, bass_index, key_index etc.
             waveform = batch["audio"].to(device)
+            root_labels = batch["root_chord_index"].to(device)
+            bass_labels = batch["bass_index"].to(device)
+            key_labels = batch["key_index"].to(device)
 
-            root_labels = batch["root_chord_index"].to(device)  # (B, T)
-            bass_labels = batch["bass_index"].to(device)  # (B, T)
-            key_labels = batch["key_index"].to(device)  # (B, T)
-
-            # マスクの生成 (Rootラベルに-100が含まれている場合、パディングとみなす)
-            # 全てのラベルでパディング位置は同じはずなので、Rootで代表させます
             mask = (root_labels != -100).byte()
 
-            # パディング部分のラベルは学習に使われないようにする
-            # 安全のため、マスクされる部分のラベルを0に置換
-            safe_root = root_labels.clone()
-            safe_root[~mask.bool()] = 0
-
-            safe_bass = bass_labels.clone()
-            safe_bass[~mask.bool()] = 0
-
-            safe_key = key_labels.clone()
-            safe_key[~mask.bool()] = 0
-
             optimizer.zero_grad()
-
-            loss = model(waveform, root_labels=safe_root, bass_labels=safe_bass, key_labels=safe_key, mask=mask)
-
+            loss = model(waveform, root_labels=root_labels, bass_labels=bass_labels, key_labels=key_labels, mask=mask)
             loss.backward()
             optimizer.step()
 
@@ -126,9 +174,21 @@ def main():
             count += 1
             progress.set_postfix(loss=loss.item())
 
-        avg_loss = total_loss / count
-        print(f"Epoch {epoch} Loss: {avg_loss:.4f}")
-        writer.add_scalar("Train/loss", avg_loss, epoch)
+        avg_train_loss = total_loss / count
+        print(f"Epoch {epoch} Train Loss: {avg_train_loss:.4f}")
+        writer.add_scalar("Train/loss", avg_train_loss, epoch)
+
+        # Validation Loop
+        val_metrics = val_loop(model, valid_loader, device)
+        print(f"Epoch {epoch} Valid Loss: {val_metrics['loss']:.4f}")
+        print(f"  Root Acc: {val_metrics['root_acc']:.4f}")
+        print(f"  Bass Acc: {val_metrics['bass_acc']:.4f}")
+        print(f"  Key Acc:  {val_metrics['key_acc']:.4f}")
+
+        writer.add_scalar("Valid/loss", val_metrics["loss"], epoch)
+        writer.add_scalar("Valid/root_acc", val_metrics["root_acc"], epoch)
+        writer.add_scalar("Valid/bass_acc", val_metrics["bass_acc"], epoch)
+        writer.add_scalar("Valid/key_acc", val_metrics["key_acc"], epoch)
 
         # チェックポイントの保存
         save_path = output_dir / f"crf_epoch_{epoch:03d}.pt"
@@ -137,6 +197,7 @@ def main():
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "val_metrics": val_metrics,
             },
             save_path,
         )

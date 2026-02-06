@@ -34,8 +34,31 @@ class TranscriptionCRFModel(nn.Module):
             raise ImportError("pytorch-crf is required for TranscriptionCRFModel")
 
         # New Projection Heads
-        self.root_head = nn.Linear(25+12, self.num_root_tags)
-        self.bass_head = nn.Linear(25+12, self.num_bass_tags)
+        self.root_head = nn.Linear(self.num_root_tags, self.num_root_tags)
+        self.bass_head = nn.Linear(self.num_bass_tags, self.num_bass_tags)
+        self.key_head = nn.Linear(self.num_key_tags, self.num_key_tags)
+
+    def _get_emissions(self, waveform: torch.Tensor):
+        # Base modelの推論 (勾配計算なし)
+        self.base_model.eval()
+        with torch.no_grad():
+            outputs = self.base_model(waveform)
+            # 各タスクのLogitsを取得
+            root_logits = outputs.get("initial_root_chord_logits")
+            bass_logits = outputs.get("initial_bass_logits")
+            key_logits = outputs.get("initial_key_logits")  # [B, T, C]
+
+            if root_logits is None:
+                raise KeyError("base model output missing 'initial_root_chord_logits'")
+            if bass_logits is None:
+                raise KeyError("base model output missing 'initial_bass_logits'")
+            if key_logits is None:
+                raise KeyError("base model output missing 'initial_key_logits'")
+
+        emissions_root = self.root_head(root_logits)
+        emissions_bass = self.bass_head(bass_logits)
+        emissions_key = self.key_head(key_logits)
+        return emissions_root, emissions_bass, emissions_key
 
     def forward(
         self,
@@ -60,21 +83,7 @@ class TranscriptionCRFModel(nn.Module):
                 predictions (Dict[str, List[List[int]]]): 各タスクのViterbiデコード結果
                     keys: 'root', 'bass', 'key'
         """
-        # Base modelの推論 (勾配計算なし)
-        self.base_model.eval()
-        with torch.no_grad():
-            outputs = self.base_model(waveform)
-            # 各タスクのLogitsを取得
-            initial_smooth_chord25_logits = outputs.get("initial_smooth_chord25_original") # [B, T, 25+12]
-            emissions_key = outputs.get("initial_key_logits")  # [B, T, C]
-
-            if initial_smooth_chord25_logits is None:
-                raise KeyError("base model output missing 'initial_smooth_chord25_original'")
-            if emissions_key is None:
-                raise KeyError("base model output missing 'initial_key_logits'")
-
-        emissions_root = self.root_head(initial_smooth_chord25_logits)
-        emissions_bass = self.bass_head(initial_smooth_chord25_logits)
+        emissions_root, emissions_bass, emissions_key = self._get_emissions(waveform)
 
         if mask is not None:
             mask = mask.bool()
@@ -108,16 +117,18 @@ class TranscriptionCRFModel(nn.Module):
             loss = torch.tensor(0.0, device=waveform.device)
 
             if root_labels is not None:
-                # reduction='mean' for batch averaging
-                nll_root = -self.crf_root(emissions_root, root_labels, mask=mask, reduction="mean")
+                safe_root = root_labels.masked_fill(root_labels < 0, 0)
+                nll_root = -self.crf_root(emissions_root, safe_root, mask=mask, reduction="mean")
                 loss += nll_root
 
             if bass_labels is not None:
-                nll_bass = -self.crf_bass(emissions_bass, bass_labels, mask=mask, reduction="mean")
+                safe_bass = bass_labels.masked_fill(bass_labels < 0, 0)
+                nll_bass = -self.crf_bass(emissions_bass, safe_bass, mask=mask, reduction="mean")
                 loss += nll_bass
 
             if key_labels is not None:
-                nll_key = -self.crf_key(emissions_key, key_labels, mask=mask, reduction="mean")
+                safe_key = key_labels.masked_fill(key_labels < 0, 0)
+                nll_key = -self.crf_key(emissions_key, safe_key, mask=mask, reduction="mean")
                 loss += nll_key
 
             return loss
@@ -129,6 +140,53 @@ class TranscriptionCRFModel(nn.Module):
             preds["bass"] = self.crf_bass.decode(emissions_bass, mask=mask)
             preds["key"] = self.crf_key.decode(emissions_key, mask=mask)
             return preds
+
+    def get_loss_and_preds(
+        self,
+        waveform: torch.Tensor,
+        root_labels: Optional[torch.Tensor] = None,
+        bass_labels: Optional[torch.Tensor] = None,
+        key_labels: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, List[List[int]]]]:
+        """
+        検証用: LossとPredictionsの両方を返します。
+        """
+        emissions_root, emissions_bass, emissions_key = self._get_emissions(waveform)
+
+        if mask is not None:
+            mask = mask.bool()
+            # mask fix logic (duplicated for now or shared if I refactor more, sticking to inline for clarity/safety of replace)
+            if not mask[:, 0].all():
+                invalid_indices = torch.where(~mask[:, 0])[0]
+                mask[invalid_indices, 0] = True
+                if root_labels is not None:
+                    preds = emissions_root.argmax(dim=-1)
+                    root_labels[invalid_indices, 0] = preds[invalid_indices, 0]
+                if bass_labels is not None:
+                    preds = emissions_bass.argmax(dim=-1)
+                    bass_labels[invalid_indices, 0] = preds[invalid_indices, 0]
+                if key_labels is not None:
+                    preds = emissions_key.argmax(dim=-1)
+                    key_labels[invalid_indices, 0] = preds[invalid_indices, 0]
+
+        loss = torch.tensor(0.0, device=waveform.device)
+        if root_labels is not None:
+            safe_root = root_labels.masked_fill(root_labels < 0, 0)
+            loss += -self.crf_root(emissions_root, safe_root, mask=mask, reduction="mean")
+        if bass_labels is not None:
+            safe_bass = bass_labels.masked_fill(bass_labels < 0, 0)
+            loss += -self.crf_bass(emissions_bass, safe_bass, mask=mask, reduction="mean")
+        if key_labels is not None:
+            safe_key = key_labels.masked_fill(key_labels < 0, 0)
+            loss += -self.crf_key(emissions_key, safe_key, mask=mask, reduction="mean")
+
+        preds = {}
+        preds["root"] = self.crf_root.decode(emissions_root, mask=mask)
+        preds["bass"] = self.crf_bass.decode(emissions_bass, mask=mask)
+        preds["key"] = self.crf_key.decode(emissions_key, mask=mask)
+
+        return loss, preds
 
     def train(self, mode: bool = True):
         """

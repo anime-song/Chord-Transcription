@@ -114,7 +114,7 @@ class AudioTranscriber:
         - DataParallel/DDPによる 'module.' 接頭辞を自動で削除。
         """
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
             if "ema_state_dict" in checkpoint:
                 model.load_state_dict(checkpoint["ema_state_dict"], strict=True)
