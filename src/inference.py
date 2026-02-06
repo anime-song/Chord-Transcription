@@ -14,7 +14,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 from .transcribers.base_transcriber import AudioTranscriber, load_config
 
 
-def process_predictions_to_events(predictions: Dict[str, Any]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+def process_predictions_to_events(
+    predictions: Dict[str, Any], min_duration_chord: float = 0.1, min_duration_key: float = 0.5
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     フレームごとの予測結果を、コード・キー・セクションのイベントに変換する。
     """
@@ -104,6 +106,30 @@ def process_predictions_to_events(predictions: Dict[str, Any]) -> Tuple[List[Dic
             # 最後のセグメントを追加
             end_time = frame_times[limit - 1] + frame_duration
             key_events.append({"start_time": segment_start_time, "end_time": end_time, "key": last_key_label})
+
+    def filter_events(events: List[Dict], min_dur: float, label_key: str) -> List[Dict]:
+        if not events:
+            return []
+        filtered = []
+        for event in events:
+            duration = event["end_time"] - event["start_time"]
+            if duration < min_dur and filtered:
+                # 前のイベントを延長
+                filtered[-1]["end_time"] = event["end_time"]
+            else:
+                # 前のイベントと同じラベルなら結合
+                if filtered and filtered[-1][label_key] == event[label_key]:
+                    filtered[-1]["end_time"] = event["end_time"]
+                else:
+                    filtered.append(event)
+        return filtered
+
+    # フィルタリング適用
+    if min_duration_chord > 0:
+        chord_events = filter_events(chord_events, min_duration_chord, "chord")
+
+    if min_duration_key > 0:
+        key_events = filter_events(key_events, min_duration_key, "key")
 
     return chord_events, key_events
 
@@ -212,6 +238,18 @@ def main():
         "--quality_json", type=Path, default="./data/quality.json", help="qualityラベルのJSONファイルへのパス"
     )
     parser.add_argument("--use_segment_model", action="store_true")
+    parser.add_argument(
+        "--min_duration_chord",
+        type=float,
+        default=0.1,
+        help="コードイベントの最小継続時間(秒)。これより短いイベントは前のイベントに結合されます。",
+    )
+    parser.add_argument(
+        "--min_duration_key",
+        type=float,
+        default=1.0,
+        help="キーイベントの最小継続時間(秒)。これより短いイベントは前のイベントに結合されます。",
+    )
     args = parser.parse_args()
 
     if args.checkpoint is None and args.crf_checkpoint is None:
@@ -238,7 +276,9 @@ def main():
 
         # フレームごとの予測をイベント（コードチェンジ、キーチェンジ）に変換
         if predictions:
-            chord_events, key_events = process_predictions_to_events(predictions)
+            chord_events, key_events = process_predictions_to_events(
+                predictions, min_duration_chord=args.min_duration_chord, min_duration_key=args.min_duration_key
+            )
 
             # 結果の表示と保存
             audio_path = Path(args.audio)
