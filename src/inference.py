@@ -6,7 +6,6 @@ from typing import Dict, Any, List, Tuple
 import matplotlib
 import numpy as np
 import torch
-import sys
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -218,10 +217,7 @@ def main():
     """引数を解析し、推論処理を実行するメイン関数。"""
     parser = argparse.ArgumentParser(description="音声からコード進行とキーをTSV形式で推論・保存するスクリプト")
     parser.add_argument("--config", type=str, required=True, help="モデル設定ファイル(YAML/JSON)へのパス")
-    parser.add_argument("--checkpoint", type=str, default=None, help="学習済みモデルのチェックポイントへのパス")
-    parser.add_argument(
-        "--crf_checkpoint", type=str, default=None, help="CRFモデルのチェックポイントへのパス (Optional)"
-    )
+    parser.add_argument("--checkpoint", type=str, required=True, help="学習済みモデルのチェックポイントへのパス")
     parser.add_argument("--audio", type=str, required=True, help="入力音声ファイルへのパス")
     parser.add_argument(
         "--device",
@@ -247,15 +243,10 @@ def main():
     parser.add_argument(
         "--min_duration_key",
         type=float,
-        default=1.0,
+        default=2.0,
         help="キーイベントの最小継続時間(秒)。これより短いイベントは前のイベントに結合されます。",
     )
     args = parser.parse_args()
-
-    if args.checkpoint is None and args.crf_checkpoint is None:
-        print("\n[ERROR] 推論には checkpoint または crf_checkpoint の少なくとも一方が必要です。")
-        print("プログラムを終了します。")
-        sys.exit(1)
 
     try:
         # セットアップ
@@ -265,7 +256,6 @@ def main():
             checkpoint_path=args.checkpoint,
             device=args.device,
             quality_json_path=args.quality_json,
-            crf_checkpoint_path=args.crf_checkpoint,
             use_segment_model=args.use_segment_model,
         )
 

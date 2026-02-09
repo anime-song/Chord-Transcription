@@ -120,8 +120,10 @@ base_model_training:
       chord25: 10.0
       smooth_chord25: 10.0
 
-crf_training:
-  epochs: 100
-  batch_size: 2
-  segment_seconds: 30.0
-  lr: 1.0e-3
+segment_decode:
+  enabled: true
+  heads: ["root_chord", "bass"]
+  threshold: 0.5
+  nms_window_radius: 3
+  min_segment_length: 4
+  max_segments: null

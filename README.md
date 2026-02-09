@@ -128,15 +128,6 @@ uv run python -m src.train_segment_transcription --config ./configs/train.yaml -
 
 ```
 
-### Step 3. CRF Training
-
-Specify the weights from the second-stage model in the checkpoint.
-
-```bash
-uv run python -m src.train_crf --config ./configs/train.yaml --checkpoint <segment_model.pt>
-
-```
-
 # Inference
 
 ### Inference with the First-Stage Model
@@ -150,13 +141,6 @@ uv run python -m src.inference --config ./configs/train.yaml --checkpoint <base_
 
 ```bash
 uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --audio <audio_path> --use_segment_model
-
-```
-
-### Inference with CRF
-
-```bash
-uv run python -m src.inference --config ./configs/train.yaml --crf_checkpoint <crf_model.pt> --audio <audio_path> --use_segment_model
 
 ```
 

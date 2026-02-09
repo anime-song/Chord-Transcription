@@ -8,7 +8,7 @@ import numpy as np
 
 
 from src.utils import build_model_from_config
-from src.models.crf_wrapper import TranscriptionCRFModel
+from src.models.segment_model import BatchBoundarySegmenter
 from stem_splitter.inference import separate_stems
 
 try:
@@ -45,7 +45,6 @@ class AudioTranscriber:
         checkpoint_path: Optional[str],
         device: str,
         quality_json_path: Path,
-        crf_checkpoint_path: Optional[str] = None,
         use_segment_model: bool = False,
     ):
         """
@@ -55,16 +54,32 @@ class AudioTranscriber:
         self.device = torch.device(device)
         self.model = build_model_from_config(self.config, use_segment_model=use_segment_model).to(self.device)
 
-        if checkpoint_path and not crf_checkpoint_path:
-            self._load_checkpoint(self.model, checkpoint_path)
+        if not checkpoint_path:
+            raise ValueError("checkpoint_path は必須です。")
+        self._load_checkpoint(self.model, checkpoint_path)
 
-        self.use_crf = False
-        if crf_checkpoint_path:
-            print(f"[INFO] CRFチェックポイントを読み込みます: {crf_checkpoint_path}")
-            # Base modelをラップする
-            self.model = TranscriptionCRFModel(self.model).to(self.device)
-            self._load_checkpoint(self.model, crf_checkpoint_path)
-            self.use_crf = True
+        self.segment_decode_cfg = self.config.get("segment_decode", {}) or {}
+        self.use_boundary_segment_decode = bool(self.segment_decode_cfg.get("enabled", False))
+        self.segment_decode_heads = self.segment_decode_cfg.get("heads", ["root_chord", "bass"])
+        self.boundary_segmenter: Optional[BatchBoundarySegmenter] = None
+        if self.use_boundary_segment_decode:
+            threshold = float(self.segment_decode_cfg.get("threshold", 0.5))
+            nms_window_radius = int(self.segment_decode_cfg.get("nms_window_radius", 3))
+            min_segment_length = int(self.segment_decode_cfg.get("min_segment_length", 4))
+            max_segments = self.segment_decode_cfg.get("max_segments", None)
+            max_segments = int(max_segments) if max_segments is not None else None
+            self.boundary_segmenter = BatchBoundarySegmenter(
+                threshold=threshold,
+                nms_window_radius=nms_window_radius,
+                min_segment_length=min_segment_length,
+                max_segments=max_segments,
+            )
+            print(
+                "[INFO] boundary-segment decode を有効化しました "
+                f"(heads={self.segment_decode_heads}, threshold={threshold}, "
+                f"nms_window_radius={nms_window_radius}, min_segment_length={min_segment_length}, "
+                f"max_segments={max_segments})"
+            )
 
         self.model.eval()
         torch.set_grad_enabled(False)
@@ -115,13 +130,17 @@ class AudioTranscriber:
         """
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            state_dict = None
 
             if "ema_state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["ema_state_dict"], strict=True)
+                state_dict = checkpoint["ema_state_dict"]
             elif "model_state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+                state_dict = checkpoint["model_state_dict"]
             else:
                 raise KeyError("チェックポイントファイルから有効な state_dict を見つけられませんでした。")
+
+            model.load_state_dict(state_dict, strict=True)
+
             print(f"[INFO] {model.__class__.__name__} のチェックポイントを正常に読み込みました: {checkpoint_path}")
 
         except FileNotFoundError:
@@ -188,6 +207,97 @@ class AudioTranscriber:
         concatenated = torch.cat(padded_waveforms, dim=0).unsqueeze(0)
         return concatenated.to(self.device)
 
+    def _segmentwise_decode_indices(
+        self,
+        logits: torch.Tensor,
+        segment_ids_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        各セグメント内でlogitsを平均し、セグメントごとに1クラスを決定してフレームへ展開する。
+        logits: (B, T, C), segment_ids_batch: (B, T)
+        returns: (B, T) long
+        """
+        if logits.ndim != 3:
+            raise ValueError(f"logits must be 3D (B, T, C), but got shape={tuple(logits.shape)}")
+        if segment_ids_batch.ndim != 2:
+            raise ValueError(f"segment_ids_batch must be 2D (B, T), but got shape={tuple(segment_ids_batch.shape)}")
+        if logits.shape[:2] != segment_ids_batch.shape:
+            raise ValueError(
+                "shape mismatch: logits and segment_ids_batch must share (B, T), "
+                f"but got {tuple(logits.shape[:2])} and {tuple(segment_ids_batch.shape)}"
+            )
+
+        batch_size, total_frames, num_classes = logits.shape
+        decoded = torch.empty((batch_size, total_frames), device=logits.device, dtype=torch.long)
+
+        for b in range(batch_size):
+            seg_ids = segment_ids_batch[b].long()
+            if seg_ids.numel() == 0:
+                continue
+
+            num_segments = int(seg_ids.max().item()) + 1
+            segment_sums = torch.zeros((num_segments, num_classes), device=logits.device, dtype=logits.dtype)
+            segment_counts = torch.zeros((num_segments, 1), device=logits.device, dtype=logits.dtype)
+
+            segment_sums.index_add_(0, seg_ids, logits[b])
+            ones = torch.ones((total_frames, 1), device=logits.device, dtype=logits.dtype)
+            segment_counts.index_add_(0, seg_ids, ones)
+
+            segment_means = segment_sums / segment_counts.clamp_min(1.0)
+            segment_labels = segment_means.argmax(dim=-1)
+            decoded[b] = segment_labels.index_select(0, seg_ids)
+
+        return decoded
+
+    def _decode_with_boundary_segments(self, model_outputs: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+        if not self.use_boundary_segment_decode or self.boundary_segmenter is None:
+            return {}
+
+        boundary_logits = model_outputs.get("initial_boundary_logits")
+        if boundary_logits is None:
+            print("[WARN] 'initial_boundary_logits' がないため boundary-segment decode をスキップします。")
+            return {}
+        if boundary_logits.ndim not in (2, 3):
+            print(
+                "[WARN] 'initial_boundary_logits' の次元が不正です "
+                f"(shape={tuple(boundary_logits.shape)})。boundary-segment decode をスキップします。"
+            )
+            return {}
+
+        if boundary_logits.ndim == 2:
+            boundary_logits = boundary_logits.unsqueeze(-1)
+        batch_size, total_frames, _ = boundary_logits.shape
+        dummy_features = torch.zeros(
+            (batch_size, total_frames, 1),
+            device=boundary_logits.device,
+            dtype=boundary_logits.dtype,
+        )
+        _, _, segment_ids_batch, segments_info = self.boundary_segmenter.process_batch(
+            frame_features=dummy_features,
+            boundary_logits=boundary_logits,
+            detach_boundary=True,
+        )
+
+        if batch_size > 0:
+            print(f"[INFO] boundary-segment decode: segments={len(segments_info[0])}, frames={total_frames}")
+
+        decoded_indices: Dict[str, np.ndarray] = {}
+        for head in self.segment_decode_heads:
+            logits_key = f"initial_{head}_logits"
+            logits = model_outputs.get(logits_key)
+            if logits is None:
+                print(f"[WARN] 出力 '{logits_key}' がないため、{head} のsegment decodeをスキップします。")
+                continue
+            try:
+                decoded = self._segmentwise_decode_indices(logits, segment_ids_batch)
+            except ValueError as exc:
+                print(f"[WARN] {head} のsegment decodeに失敗しました: {exc}")
+                continue
+
+            decoded_indices[head] = decoded.detach().cpu().numpy()
+
+        return decoded_indices
+
     def predict(self, audio_path: str, stems_dir: str, reuse_stems: bool) -> Dict[str, Any]:
         """
         音声ファイルに対して推論を実行し、ラベル付けされた予測結果を返す。
@@ -197,53 +307,34 @@ class AudioTranscriber:
         print(f"[INFO] 入力波形 shape: {waveform.shape}")
 
         chord25_logits_np: Optional[np.ndarray] = None
-        if self.use_crf:
-            # CRFの場合、modelは indices (List[List[int]]) または tensor を返す
-            # TranscriptionCRFModel.forward(..., labels=None) -> Dict[str, List[List[int]]]
-            predictions_map = self.model(waveform)  # Dict[str, List[List[int]]]
+        predictions = {}
+        # モデルから生のlogit出力を取得
+        model_outputs: Dict[str, torch.Tensor] = self.model(waveform, max_segments=None)
+        boundary_segment_indices = self._decode_with_boundary_segments(model_outputs)
 
-            predictions = {}
-            for head, indices_list in predictions_map.items():
-                if not indices_list:
-                    continue
-                indices = indices_list[0]
+        if "initial_smooth_chord25_original" in model_outputs:
+            chord25_logits_np = model_outputs["initial_smooth_chord25_original"].squeeze(0).detach().cpu().numpy()
 
-                if head == "bass" or head == "key":
-                    predictions[head] = [PITCH_CLASS_LABELS_13[i] for i in indices]
-                elif head == "root":
-                    predictions["root_chord"] = [
-                        self.root_chord_labels[i] if 0 <= i < len(self.root_chord_labels) else "N/A" for i in indices
-                    ]
-        else:
-            predictions = {}
-            # モデルから生のlogit出力を取得
-            model_outputs: Dict[str, torch.Tensor] = self.model(waveform, max_segments=None)
-
-            if "initial_smooth_chord25_original" in model_outputs:
-                chord25_logits_np = model_outputs["initial_smooth_chord25_original"].squeeze(0).detach().cpu().numpy()
-
-            # 対象のヘッド（root_chord, bass, key）ごとに処理
-            for head in ["root_chord", "bass", "key"]:
+        # 対象のヘッド（root_chord, bass, key）ごとに処理
+        for head in ["root_chord", "bass", "key"]:
+            if head in boundary_segment_indices:
+                indices = boundary_segment_indices[head][0]
+            else:
                 logits_key = f"initial_{head}_logits"
-
-                if logits_key in model_outputs:
-                    logits = model_outputs[logits_key].squeeze(0).cpu()  # Shape: (T, C)
-                    # 最も確率の高いクラスのインデックスを取得
-                    indices = logits.argmax(dim=-1).numpy()
-
-                    if head in ["bass", "key"]:
-                        labels = [PITCH_CLASS_LABELS_13[i] for i in indices]
-                    elif head == "root_chord":
-                        labels = [
-                            self.root_chord_labels[i] if 0 <= i < len(self.root_chord_labels) else "N/A"
-                            for i in indices
-                        ]
-                    else:
-                        continue  # 他のヘッドは無視
-
-                    predictions[head] = labels
-                else:
+                if logits_key not in model_outputs:
                     print(f"[WARN] 出力 '{logits_key}' がモデルの出力に含まれていません。")
+                    continue
+                logits = model_outputs[logits_key].squeeze(0).cpu()  # Shape: (T, C)
+                indices = logits.argmax(dim=-1).numpy()
+
+            if head in ["bass", "key"]:
+                labels = [PITCH_CLASS_LABELS_13[i] for i in indices]
+            elif head == "root_chord":
+                labels = [self.root_chord_labels[i] if 0 <= i < len(self.root_chord_labels) else "N/A" for i in indices]
+            else:
+                continue
+
+            predictions[head] = labels
 
         # タイムスタンプを計算
         sample_rate = self.config["data_loader"]["sample_rate"]
