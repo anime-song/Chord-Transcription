@@ -110,13 +110,13 @@ uv run python -m src.train_segment_transcription --config ./configs/train.yaml -
 ### 1段目のモデルで推論する場合
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <base_transcription.pt> --audio <audio_path>
+uv run python -m src.inference --config ./configs/train.yaml --checkpoint <base_transcription.pt> --audio <audio_path> --use_hmm
 ```
 
 ### 2段目のモデルで推論する場合
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --audio <audio_path> --use_segment_model
+uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --audio <audio_path> --use_segment_model --use_hmm
 ```
 
 # 学習済みモデル

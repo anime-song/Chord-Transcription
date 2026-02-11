@@ -133,14 +133,14 @@ uv run python -m src.train_segment_transcription --config ./configs/train.yaml -
 ### Inference with the First-Stage Model
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <base_transcription.pt> --audio <audio_path>
+uv run python -m src.inference --config ./configs/train.yaml --checkpoint <base_transcription.pt> --audio <audio_path> --use_hmm
 
 ```
 
 ### Inference with the Second-Stage Model
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --audio <audio_path> --use_segment_model
+uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --audio <audio_path> --use_segment_model --use_hmm
 
 ```
 
