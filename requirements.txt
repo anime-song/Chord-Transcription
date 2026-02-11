@@ -12,3 +12,4 @@ tqdm
 soundfile
 tokenizers
 pytorch-crf
+chord-romanizer

@@ -18,7 +18,7 @@ except ImportError:
     yaml = None
 
 # 定数
-PITCH_CLASS_LABELS_13: List[str] = ["N", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+PITCH_CLASS_LABELS_13: List[str] = ["N", "C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
