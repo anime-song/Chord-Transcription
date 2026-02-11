@@ -358,7 +358,29 @@ class AudioTranscriber:
                     mapped.append(math.nan)
             predictions["tempo_bpm"] = mapped
 
-    def predict(self, audio_path: str, stems_dir: str, reuse_stems: bool) -> Dict[str, Any]:
+    def _apply_hmm_smoothing(self, logits: torch.Tensor) -> List[int]:
+        """
+        HMM (Viterbi) を適用して、出力を平滑化する。
+        logits: (T, C)
+        """
+        try:
+            from src.hmm import decode_viterbi_from_probs, make_sticky_transition
+        except ImportError:
+            print("[WARN] src.hmm が見つからないため、HMM適用をスキップします。")
+            return logits.argmax(dim=-1).tolist()
+        
+        # log_softmax -> exp -> probability
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        T, C = probs.shape
+
+        # 手動遷移確率 (自己遷移0.9)
+        transition_matrix = make_sticky_transition(C, stay_prob=0.9)
+        
+        # 初期確率は一様分布 (Noneで自動)
+        path = decode_viterbi_from_probs(probs, transition_matrix=transition_matrix, init_probs=None, method="jit")
+        return path.tolist()
+
+    def predict(self, audio_path: str, stems_dir: str, reuse_stems: bool, use_hmm: bool = False) -> Dict[str, Any]:
         """
         音声ファイルに対して推論を実行し、ラベル付けされた予測結果を返す。
         """
@@ -384,8 +406,16 @@ class AudioTranscriber:
                 if logits_key not in model_outputs:
                     print(f"[WARN] 出力 '{logits_key}' がモデルの出力に含まれていません。")
                     continue
-                logits = model_outputs[logits_key].squeeze(0).cpu()  # Shape: (T, C)
-                indices = logits.argmax(dim=-1).numpy()
+                
+                # Shape: (T, C)
+                logits = model_outputs[logits_key].squeeze(0) 
+
+                if use_hmm:
+                    # HMM (Viterbi) 適用 (List[int]が返る)
+                    indices = self._apply_hmm_smoothing(logits)
+                else:
+                    # 通常のArgmax
+                    indices = logits.argmax(dim=-1).cpu().numpy()
 
             if head in ["bass", "key"]:
                 labels = [PITCH_CLASS_LABELS_13[i] for i in indices]

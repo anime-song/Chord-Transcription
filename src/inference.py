@@ -358,6 +358,7 @@ def main():
         "--quality_json", type=Path, default="./data/quality.json", help="qualityラベルのJSONファイルへのパス"
     )
     parser.add_argument("--use_segment_model", action="store_true")
+    parser.add_argument("--use_hmm", action="store_true", help="HMMによる平滑化を適用する")
     parser.add_argument(
         "--min_duration_chord",
         type=float,
@@ -403,7 +404,10 @@ def main():
 
         # 推論の実行（フレームごと）
         predictions = transcriber.predict(
-            audio_path=args.audio, stems_dir=args.stems_dir, reuse_stems=not args.no_reuse_stems
+            audio_path=args.audio,
+            stems_dir=args.stems_dir,
+            reuse_stems=not args.no_reuse_stems,
+            use_hmm=args.use_hmm,
         )
 
         # フレームごとの予測をイベント（コードチェンジ、キーチェンジ）に変換
