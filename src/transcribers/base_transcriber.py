@@ -368,14 +368,14 @@ class AudioTranscriber:
         except ImportError:
             print("[WARN] src.hmm が見つからないため、HMM適用をスキップします。")
             return logits.argmax(dim=-1).tolist()
-        
+
         # log_softmax -> exp -> probability
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
         T, C = probs.shape
 
         # 手動遷移確率 (自己遷移0.9)
         transition_matrix = make_sticky_transition(C, stay_prob=0.9)
-        
+
         # 初期確率は一様分布 (Noneで自動)
         path = decode_viterbi_from_probs(probs, transition_matrix=transition_matrix, init_probs=None, method="jit")
         return path.tolist()
@@ -406,9 +406,9 @@ class AudioTranscriber:
                 if logits_key not in model_outputs:
                     print(f"[WARN] 出力 '{logits_key}' がモデルの出力に含まれていません。")
                     continue
-                
+
                 # Shape: (T, C)
-                logits = model_outputs[logits_key].squeeze(0) 
+                logits = model_outputs[logits_key].squeeze(0)
 
                 if use_hmm:
                     # HMM (Viterbi) 適用 (List[int]が返る)

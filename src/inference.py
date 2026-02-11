@@ -118,42 +118,42 @@ def process_predictions_to_events(
         try:
             from chord_romanizer import Romanizer, ChordParser
 
-            romanizer = Romanizer()
+            romanizer = Romanizer(simplify_accidentals=True)
             progression_sequence = []
-            
+
             # IDによるマッピングを保持して、フィルタリング後の結果を元のイベントに戻せるようにする
-            parsed_chord_map = {} # {id(parsed_chord): index_in_chord_events}
+            parsed_chord_map = {}  # {id(parsed_chord): index_in_chord_events}
 
             # 各コードセグメントに対して、最も重なりの大きいキーを割り当てる
             for i, chord_event in enumerate(chord_events):
                 c_start = chord_event["start_time"]
                 c_end = chord_event["end_time"]
-                
-                best_key = "C" # Default
+
+                best_key = "C"  # Default
                 max_overlap = -1.0
 
                 for key_event in key_events:
                     k_start = key_event["start_time"]
                     k_end = key_event["end_time"]
-                    
+
                     overlap_start = max(c_start, k_start)
                     overlap_end = min(c_end, k_end)
                     overlap = max(0.0, overlap_end - overlap_start)
-                    
+
                     if overlap > max_overlap:
                         max_overlap = overlap
                         best_key = key_event["key"]
-                
-                if best_key == "N": 
-                   best_key = "C"
+
+                if best_key == "N":
+                    best_key = "C"
 
                 parsed = ChordParser.parse(chord_event["chord"])
-                
+
                 # Parse失敗時は "N" (No Chord) として扱うことでクラッシュを回避
                 if parsed is None:
                     # Nをパースしてダミーオブジェクトを作成
                     parsed = ChordParser.parse("N")
-                
+
                 if parsed:
                     parsed_chord_map[id(parsed)] = i
                     progression_sequence.append((parsed, best_key))
@@ -163,7 +163,7 @@ def process_predictions_to_events(
 
             # 結果を適用 (IDで照合)
             for result in annotated:
-                if result and result.chord: # result.chord is the Original ParsedChord object
+                if result and result.chord:  # result.chord is the Original ParsedChord object
                     idx = parsed_chord_map.get(id(result.chord))
                     if idx is not None and result.symbol_fixed:
                         chord_events[idx]["chord"] = result.symbol_fixed
