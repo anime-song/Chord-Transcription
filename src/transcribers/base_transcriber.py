@@ -358,7 +358,7 @@ class AudioTranscriber:
                     mapped.append(math.nan)
             predictions["tempo_bpm"] = mapped
 
-    def _apply_hmm_smoothing(self, logits: torch.Tensor) -> List[int]:
+    def _apply_hmm_smoothing(self, logits: torch.Tensor, stay_prob: float = 0.9) -> List[int]:
         """
         HMM (Viterbi) を適用して、出力を平滑化する。
         logits: (T, C)
@@ -373,8 +373,8 @@ class AudioTranscriber:
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
         T, C = probs.shape
 
-        # 手動遷移確率 (自己遷移0.9)
-        transition_matrix = make_sticky_transition(C, stay_prob=0.9)
+        # 手動遷移確率
+        transition_matrix = make_sticky_transition(C, stay_prob=stay_prob)
 
         # 初期確率は一様分布 (Noneで自動)
         path = decode_viterbi_from_probs(probs, transition_matrix=transition_matrix, init_probs=None, method="jit")
@@ -398,7 +398,8 @@ class AudioTranscriber:
             chord25_logits_np = model_outputs["initial_smooth_chord25_original"].squeeze(0).detach().cpu().numpy()
 
         # 対象のヘッド（root_chord, bass, key）ごとに処理
-        for head in ["root_chord", "bass", "key"]:
+        stay_probs = [1.0, 1.0, 0.9]
+        for i, head in enumerate(["root_chord", "bass", "key"]):
             if head in boundary_segment_indices:
                 indices = boundary_segment_indices[head][0]
             else:
@@ -412,7 +413,7 @@ class AudioTranscriber:
 
                 if use_hmm:
                     # HMM (Viterbi) 適用 (List[int]が返る)
-                    indices = self._apply_hmm_smoothing(logits)
+                    indices = self._apply_hmm_smoothing(logits, stay_prob=stay_probs[i])
                 else:
                     # 通常のArgmax
                     indices = logits.argmax(dim=-1).cpu().numpy()
