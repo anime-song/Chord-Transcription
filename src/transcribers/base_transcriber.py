@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -8,7 +9,7 @@ import numpy as np
 
 
 from src.utils import build_model_from_config
-from src.models.segment_model import BatchBoundarySegmenter
+from src.models.segment_model import BatchBoundarySegmenter, resolve_segment_decode_params
 from stem_splitter.inference import separate_stems
 
 try:
@@ -58,16 +59,15 @@ class AudioTranscriber:
             raise ValueError("checkpoint_path は必須です。")
         self._load_checkpoint(self.model, checkpoint_path)
 
-        self.segment_decode_cfg = self.config.get("segment_decode", {}) or {}
-        self.use_boundary_segment_decode = bool(self.segment_decode_cfg.get("enabled", False))
-        self.segment_decode_heads = self.segment_decode_cfg.get("heads", ["root_chord", "bass"])
+        self.segment_decode_cfg = resolve_segment_decode_params(self.config.get("segment_decode", {}))
+        self.use_boundary_segment_decode = bool(self.segment_decode_cfg["enabled"])
+        self.segment_decode_heads = self.segment_decode_cfg["heads"]
         self.boundary_segmenter: Optional[BatchBoundarySegmenter] = None
         if self.use_boundary_segment_decode:
-            threshold = float(self.segment_decode_cfg.get("threshold", 0.5))
-            nms_window_radius = int(self.segment_decode_cfg.get("nms_window_radius", 3))
-            min_segment_length = int(self.segment_decode_cfg.get("min_segment_length", 4))
-            max_segments = self.segment_decode_cfg.get("max_segments", None)
-            max_segments = int(max_segments) if max_segments is not None else None
+            threshold = self.segment_decode_cfg["threshold"]
+            nms_window_radius = self.segment_decode_cfg["nms_window_radius"]
+            min_segment_length = self.segment_decode_cfg["min_segment_length"]
+            max_segments = self.segment_decode_cfg["max_segments"]
             self.boundary_segmenter = BatchBoundarySegmenter(
                 threshold=threshold,
                 nms_window_radius=nms_window_radius,
@@ -86,6 +86,7 @@ class AudioTranscriber:
 
         self.quality_labels = self._load_quality_labels(quality_json_path)
         self.root_chord_labels = self._build_root_chord_labels()
+        self.tempo_decode_cfg = self.config.get("tempo_decode", {}) or {}
 
     def _load_quality_labels(self, quality_json_path: Path) -> Dict[str, str]:
         with Path(quality_json_path).expanduser().resolve().open("r", encoding="utf-8") as f:
@@ -298,6 +299,65 @@ class AudioTranscriber:
 
         return decoded_indices
 
+    def _decode_tempo(self, model_outputs: Dict[str, torch.Tensor], predictions: Dict[str, Any]) -> None:
+        """
+        initial_tempo を tempo_bpm（または tempo_class）へ変換して predictions に追加する。
+        - 回帰: regression_scale が "log" の場合は exp で BPM に戻す。
+               "linear" の場合は出力をそのまま BPM として扱う。
+        - 分類: argmax を tempo_class として返し、tempo_class_values があれば tempo_bpm に変換
+        """
+        tempo_logits = model_outputs.get("initial_tempo")
+        if tempo_logits is None:
+            return
+
+        regression_scale = str(self.tempo_decode_cfg.get("regression_scale", "log")).lower()
+        if regression_scale not in {"log", "linear"}:
+            print(f"[WARN] tempo_decode.regression_scale が不正です: {regression_scale}. 'log'として扱います。")
+            regression_scale = "log"
+
+        bpm_min = float(self.tempo_decode_cfg.get("bpm_min", 30.0))
+        bpm_max = float(self.tempo_decode_cfg.get("bpm_max", 300.0))
+
+        def decode_regression_to_bpm(pred_values: np.ndarray) -> np.ndarray:
+            if regression_scale == "log":
+                bpm = np.exp(pred_values)
+            else:
+                bpm = pred_values
+            return np.clip(bpm, bpm_min, bpm_max)
+
+        tempo_tensor = tempo_logits.squeeze(0).detach().cpu()
+        if tempo_tensor.ndim == 1:
+            # (T,) を回帰として解釈
+            pred_values = tempo_tensor.numpy().astype(np.float32)
+            bpm = decode_regression_to_bpm(pred_values)
+            predictions["tempo_bpm"] = bpm.astype(np.float32).tolist()
+            return
+
+        if tempo_tensor.ndim != 2:
+            print(f"[WARN] initial_tempo の形状が想定外です: {tuple(tempo_tensor.shape)}")
+            return
+
+        if tempo_tensor.size(-1) == 1:
+            pred_values = tempo_tensor.squeeze(-1).numpy().astype(np.float32)
+            bpm = decode_regression_to_bpm(pred_values)
+            predictions["tempo_bpm"] = bpm.astype(np.float32).tolist()
+            return
+
+        # 分類モード
+        class_indices = tempo_tensor.argmax(dim=-1).numpy().astype(np.int64)
+        predictions["tempo_class"] = class_indices.tolist()
+
+        class_values = self.tempo_decode_cfg.get("tempo_class_values")
+        if isinstance(class_values, list) and len(class_values) == int(tempo_tensor.size(-1)):
+            mapped = []
+            for idx in class_indices:
+                value = class_values[int(idx)]
+                try:
+                    mapped.append(float(value))
+                except (TypeError, ValueError):
+                    mapped.append(math.nan)
+            predictions["tempo_bpm"] = mapped
+
     def predict(self, audio_path: str, stems_dir: str, reuse_stems: bool) -> Dict[str, Any]:
         """
         音声ファイルに対して推論を実行し、ラベル付けされた予測結果を返す。
@@ -335,6 +395,8 @@ class AudioTranscriber:
                 continue
 
             predictions[head] = labels
+
+        self._decode_tempo(model_outputs, predictions)
 
         # タイムスタンプを計算
         sample_rate = self.config["data_loader"]["sample_rate"]

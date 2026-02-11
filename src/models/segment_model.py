@@ -2,12 +2,35 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.utils.checkpoint
-from typing import Optional, Dict, Tuple, List, Union
+from typing import Optional, Dict, Tuple, List, Union, Any
 import random
 
 
 from .transformer import RMSNorm, Transformer
 from .transcription_model import Backbone
+
+
+def resolve_segment_decode_params(segment_decode_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    segment_decode設定を正規化して返す。
+    学習時・推論時で同じ設定解釈を使うための共通関数。
+    """
+    cfg = segment_decode_cfg or {}
+    max_segments = cfg.get("max_segments", None)
+    if max_segments is not None:
+        max_segments = int(max_segments)
+    heads = cfg.get("heads", ["root_chord", "bass"])
+    if not isinstance(heads, list) or not heads:
+        heads = ["root_chord", "bass"]
+
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "heads": heads,
+        "threshold": float(cfg.get("threshold", 0.5)),
+        "nms_window_radius": int(cfg.get("nms_window_radius", 3)),
+        "min_segment_length": int(cfg.get("min_segment_length", 4)),
+        "max_segments": max_segments,
+    }
 
 
 def checkpoint_bypass(func, *args, **kwargs):
@@ -217,7 +240,7 @@ class BatchBoundarySegmenter:
         # 計算ロジック担当のクラス（DI: Dependency Injection）
         self.processor = feature_processor or SegmentFeatureProcessor()
 
-    def set_max_segments(self, max_segments: int):
+    def set_max_segments(self, max_segments: Optional[int]):
         self.max_segments = max_segments
 
     @torch.no_grad()
@@ -368,6 +391,10 @@ class SegmentTranscriptionModel(nn.Module):
         transformer_num_heads: int = 8,
         transformer_num_layers: int = 3,
         segment_augment_params: Optional[Dict[str, Union[int, float]]] = None,
+        segment_threshold: float = 0.5,
+        segment_nms_window_radius: int = 3,
+        segment_min_segment_length: int = 4,
+        segment_max_segments: Optional[int] = 256,
     ) -> None:
         super().__init__()
         self.backbone = backbone
@@ -394,7 +421,10 @@ class SegmentTranscriptionModel(nn.Module):
 
         # --- Segment Branch ---
         self.segmenter = BatchBoundarySegmenter(
-            threshold=0.5, nms_window_radius=3, min_segment_length=4, max_segments=256
+            threshold=segment_threshold,
+            nms_window_radius=segment_nms_window_radius,
+            min_segment_length=segment_min_segment_length,
+            max_segments=segment_max_segments,
         )
 
         # Segment Augmentation
@@ -518,9 +548,10 @@ class SegmentTranscriptionModel(nn.Module):
         return outputs
 
     def forward(
-        self, waveform: torch.Tensor, global_step: Optional[int] = None, max_segments: int = 256
+        self, waveform: torch.Tensor, global_step: Optional[int] = None, max_segments: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
-        self.segmenter.set_max_segments(max_segments)
+        if max_segments is not None:
+            self.segmenter.set_max_segments(max_segments)
 
         features = self.backbone(waveform)
         outputs = self._compute_heads_and_answer(features)

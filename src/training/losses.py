@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Union, List, Optional, Tuple
+from src.models.segment_model import BatchBoundarySegmenter, resolve_segment_decode_params
 
 
 class BalancedSoftmaxLoss(nn.Module):
@@ -168,6 +169,7 @@ def tempo_regression_loss(
     pred_logits: torch.Tensor,
     target_bpm: torch.Tensor,
     ignore_value: float = -100.0,
+    scale: str = "log",
 ) -> torch.Tensor:
     """テンポ（回帰）の損失を計算します。"""
     pred = pred_logits.squeeze(-1)
@@ -175,11 +177,77 @@ def tempo_regression_loss(
     if valid_mask.sum() == 0:
         return pred.sum() * 0.0
 
-    # log(BPM)ドメインでSmooth L1 Lossを計算
-    true_log_bpm = torch.log(torch.clamp(target_bpm[valid_mask], min=1.0))
-    pred_log_bpm = pred[valid_mask]
+    scale = str(scale).lower()
+    if scale == "linear":
+        true_values = target_bpm[valid_mask]
+        pred_values = pred[valid_mask]
+        return F.smooth_l1_loss(pred_values, true_values, beta=2.0, reduction="mean")
+    if scale == "log":
+        # log(BPM)ドメインでSmooth L1 Lossを計算
+        true_values = torch.log(torch.clamp(target_bpm[valid_mask], min=1.0))
+        pred_values = pred[valid_mask]
+        return F.smooth_l1_loss(pred_values, true_values, beta=0.2, reduction="mean")
 
-    return F.smooth_l1_loss(pred_log_bpm, true_log_bpm, beta=0.2, reduction="mean")
+    raise ValueError(f"Unsupported tempo regression scale: {scale}")
+
+
+def key_transition_weighted_ce_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    *,
+    transition_weight: float = 4.0,
+    transition_tolerance_frames: int = 32,
+    base_weight: float = 1.0,
+    non_key_index: int = 0,
+    ignore_non_key_to_n: bool = True,
+) -> torch.Tensor:
+    """
+    キー遷移近傍フレームの重みを上げる加重CE。
+    - 遷移は target の隣接フレーム比較で判定
+    - 遷移フレームは tolerance_frames ぶん前後へ拡張
+    """
+    if logits.ndim != 3 or target.ndim != 2:
+        raise ValueError(f"Expected logits:(B,T,C), target:(B,T), got {tuple(logits.shape)} and {tuple(target.shape)}")
+    if logits.shape[:2] != target.shape:
+        raise ValueError(f"logits and target must share (B,T), got {tuple(logits.shape[:2])} and {tuple(target.shape)}")
+
+    batch_size, num_frames, num_classes = logits.shape
+    valid_mask = target != ignore_index
+
+    # 境界検出: i-1 -> i でクラスが変わるフレーム i を1とする
+    transitions = torch.zeros((batch_size, num_frames), dtype=torch.bool, device=target.device)
+    if num_frames >= 2:
+        prev_target = target[:, :-1]
+        curr_target = target[:, 1:]
+        pair_valid = (prev_target != ignore_index) & (curr_target != ignore_index)
+        changed = pair_valid & (prev_target != curr_target)
+        if ignore_non_key_to_n:
+            changed = changed & ~((prev_target != non_key_index) & (curr_target == non_key_index))
+        transitions[:, 1:] = changed
+
+    tol = max(0, int(transition_tolerance_frames))
+    if tol > 0:
+        transitions_f = transitions.float().unsqueeze(1)  # (B,1,T)
+        transitions_f = F.max_pool1d(transitions_f, kernel_size=2 * tol + 1, stride=1, padding=tol)
+        transitions = transitions_f.squeeze(1) > 0.0
+
+    frame_weights = torch.full_like(target, fill_value=float(base_weight), dtype=logits.dtype)
+    frame_weights = torch.where(
+        transitions,
+        torch.full_like(frame_weights, float(transition_weight)),
+        frame_weights,
+    )
+    frame_weights = frame_weights * valid_mask.to(dtype=logits.dtype)
+
+    flat_logits = logits.reshape(-1, num_classes)
+    flat_target = target.reshape(-1)
+    per_frame_ce = F.cross_entropy(flat_logits, flat_target, ignore_index=ignore_index, reduction="none").reshape(
+        batch_size, num_frames
+    )
+
+    denom = frame_weights.sum().clamp_min(1.0)
+    return (per_frame_ce * frame_weights).sum() / denom
 
 
 def build_y_joint(
@@ -202,11 +270,100 @@ def build_y_joint(
     return y_joint.masked_fill(mask, ignore_index)
 
 
+def _segment_majority_targets(
+    labels: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+    ignore_index: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    セグメントごとの多数決ラベルを計算する。
+    Returns:
+      targets: (num_segments,) ignore_index込み
+      valid_counts: (num_segments,) セグメント内の有効ラベル数
+    """
+    targets = torch.full((num_segments,), ignore_index, dtype=labels.dtype, device=labels.device)
+    valid_counts = torch.zeros((num_segments,), dtype=torch.long, device=labels.device)
+
+    for seg_idx in range(num_segments):
+        seg_mask = segment_ids == seg_idx
+        seg_labels = labels[seg_mask]
+        seg_labels = seg_labels[seg_labels != ignore_index]
+        if seg_labels.numel() == 0:
+            continue
+
+        uniq, counts = torch.unique(seg_labels, return_counts=True)
+        best_idx = counts.argmax()
+        targets[seg_idx] = uniq[best_idx]
+        valid_counts[seg_idx] = seg_labels.numel()
+
+    return targets, valid_counts
+
+
+def _segment_consistency_loss_for_head(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    segment_ids_batch: torch.Tensor,
+    ignore_index: int,
+    length_weighted: bool,
+) -> Optional[torch.Tensor]:
+    """
+    セグメント単位でlogitsを平均し、セグメント多数決ラベルへのCEを計算する。
+    logits: (B, T, C), labels: (B, T), segment_ids_batch: (B, T)
+    """
+    if logits.ndim != 3 or labels.ndim != 2 or segment_ids_batch.ndim != 2:
+        return None
+    if logits.shape[:2] != labels.shape or labels.shape != segment_ids_batch.shape:
+        return None
+
+    total_loss = logits.new_tensor(0.0)
+    total_weight = logits.new_tensor(0.0)
+
+    batch_size, _, num_classes = logits.shape
+    for b in range(batch_size):
+        seg_ids = segment_ids_batch[b].long()
+        if seg_ids.numel() == 0:
+            continue
+
+        num_segments = int(seg_ids.max().item()) + 1
+        seg_sum = torch.zeros((num_segments, num_classes), device=logits.device, dtype=logits.dtype)
+        seg_count = torch.zeros((num_segments, 1), device=logits.device, dtype=logits.dtype)
+
+        seg_sum.index_add_(0, seg_ids, logits[b])
+        ones = torch.ones((seg_ids.shape[0], 1), device=logits.device, dtype=logits.dtype)
+        seg_count.index_add_(0, seg_ids, ones)
+        seg_mean = seg_sum / seg_count.clamp_min(1.0)
+
+        seg_targets, seg_valid_counts = _segment_majority_targets(
+            labels[b],
+            seg_ids,
+            num_segments=num_segments,
+            ignore_index=ignore_index,
+        )
+        valid_mask = seg_targets != ignore_index
+        if not valid_mask.any():
+            continue
+
+        ce = F.cross_entropy(seg_mean[valid_mask], seg_targets[valid_mask].long(), reduction="none")
+        if length_weighted:
+            weights = seg_valid_counts[valid_mask].to(ce.dtype).clamp_min(1.0)
+            total_loss = total_loss + (ce * weights).sum()
+            total_weight = total_weight + weights.sum()
+        else:
+            total_loss = total_loss + ce.sum()
+            total_weight = total_weight + ce.new_tensor(float(ce.numel()))
+
+    if total_weight.item() <= 0.0:
+        return None
+    return total_loss / total_weight
+
+
 def compute_losses(
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
     loss_cfg: Dict,
     root_chord_loss_fn: Optional[nn.Module] = None,
+    segment_decode_cfg: Optional[Dict] = None,
 ) -> Dict[str, torch.Tensor]:
     """モデル出力とバッチから、各タスクの損失を計算して辞書で返します。"""
     ce_ignore_index = loss_cfg.get("ce_ignore_index", -100)
@@ -236,7 +393,20 @@ def compute_losses(
     # Key
     if f"{stage}_key_logits" in outputs:
         x = outputs[f"{stage}_key_logits"]
-        loss = ce_loss_fn(x.transpose(1, 2), batch["key_index"])
+        key_emphasis_cfg = loss_cfg.get("key_transition_emphasis", {}) or {}
+        if bool(key_emphasis_cfg.get("enabled", False)):
+            loss = key_transition_weighted_ce_loss(
+                x,
+                batch["key_index"],
+                ignore_index=ce_ignore_index,
+                transition_weight=float(key_emphasis_cfg.get("transition_weight", 4.0)),
+                transition_tolerance_frames=int(key_emphasis_cfg.get("transition_tolerance_frames", 32)),
+                base_weight=float(key_emphasis_cfg.get("base_weight", 1.0)),
+                non_key_index=int(key_emphasis_cfg.get("non_key_index", 0)),
+                ignore_non_key_to_n=bool(key_emphasis_cfg.get("ignore_non_key_to_n", True)),
+            )
+        else:
+            loss = ce_loss_fn(x.transpose(1, 2), batch["key_index"])
         all_losses[f"{stage}/key"] = loss * weights.get("key", 1.0)
 
     # --- 境界検出タスク ---
@@ -256,7 +426,8 @@ def compute_losses(
     if f"{stage}_tempo" in outputs:
         tempo_output = outputs[f"{stage}_tempo"]
         if tempo_output.size(-1) == 1:  # 回帰
-            loss = tempo_regression_loss(tempo_output, batch["tempo_value"])
+            tempo_regression_scale = loss_cfg.get("tempo_regression_scale", "log")
+            loss = tempo_regression_loss(tempo_output, batch["tempo_value"], scale=tempo_regression_scale)
         else:  # 分類
             loss = ce_loss_fn(tempo_output.transpose(1, 2), batch["tempo_index"])
         all_losses[f"{stage}/tempo"] = loss * weights.get("tempo", 1.0)
@@ -281,6 +452,60 @@ def compute_losses(
             gamma=ftl_cfg.get("gamma", 1.5),
         )
         all_losses["initial/smooth_chord25"] = loss * weights.get("smooth_chord25", 1.0)
+
+    # --- Segment Consistency Loss ---
+    seg_cons_cfg = loss_cfg.get("segment_consistency", {}) or {}
+    if bool(seg_cons_cfg.get("enabled", False)) and "initial_boundary_logits" in outputs:
+        seg_params = resolve_segment_decode_params(segment_decode_cfg)
+        seg_heads = list(seg_cons_cfg.get("heads", ["root_chord", "bass"]))
+        seg_weights = seg_cons_cfg.get("weights", {}) or {}
+        length_weighted = bool(seg_cons_cfg.get("length_weighted", True))
+
+        segmenter = BatchBoundarySegmenter(
+            threshold=seg_params["threshold"],
+            nms_window_radius=seg_params["nms_window_radius"],
+            min_segment_length=seg_params["min_segment_length"],
+            max_segments=seg_params["max_segments"],
+        )
+        with torch.no_grad():
+            boundary_logits = outputs["initial_boundary_logits"]
+            if boundary_logits.ndim == 2:
+                boundary_logits = boundary_logits.unsqueeze(-1)
+            batch_size, total_frames, _ = boundary_logits.shape
+            dummy_features = torch.zeros(
+                (batch_size, total_frames, 1),
+                device=boundary_logits.device,
+                dtype=boundary_logits.dtype,
+            )
+            _, _, seg_ids_batch, _ = segmenter.process_batch(
+                frame_features=dummy_features,
+                boundary_logits=boundary_logits,
+                detach_boundary=True,
+            )
+
+        head_to_target = {
+            "root_chord": "root_chord_index",
+            "bass": "bass_index",
+            "key": "key_index",
+        }
+        for head in seg_heads:
+            logits_key = f"{stage}_{head}_logits"
+            target_key = head_to_target.get(head)
+            if target_key is None or logits_key not in outputs or target_key not in batch:
+                continue
+
+            seg_loss = _segment_consistency_loss_for_head(
+                outputs[logits_key],
+                batch[target_key],
+                seg_ids_batch,
+                ignore_index=ce_ignore_index,
+                length_weighted=length_weighted,
+            )
+            if seg_loss is None:
+                continue
+
+            head_weight = float(seg_weights.get(head, 1.0))
+            all_losses[f"{stage}/segment_consistency_{head}"] = seg_loss * head_weight
 
     # --- Structure Function Task ---
     if f"{stage}_structure_function_logits" in outputs:

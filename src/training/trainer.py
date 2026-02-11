@@ -16,6 +16,7 @@ except ImportError:
 
 from .losses import compute_losses, compute_metrics
 from .losses import BalancedSoftmaxLoss
+from src.models.segment_model import resolve_segment_decode_params
 
 
 class ModelEma(torch.nn.Module):
@@ -77,6 +78,7 @@ class Trainer:
         base_loss_cfg = config.get("base_model_training", {}).get("loss", {})
         self.loss_cfg = self.train_cfg.get("loss", base_loss_cfg) or {}
         self.ce_ignore_index = int(self.loss_cfg.get("ce_ignore_index", -100))
+        self.segment_decode_cfg = resolve_segment_decode_params(config.get("segment_decode", {}))
 
         if quality_class_counts is None:
             raise ValueError("BalancedSoftmaxLossには quality_class_counts が必要です。")
@@ -184,6 +186,7 @@ class Trainer:
                     batch,
                     self.loss_cfg,
                     root_chord_loss_fn=self.root_chord_loss_fn,
+                    segment_decode_cfg=self.segment_decode_cfg,
                 )
                 total_loss = sum(losses.values())
 

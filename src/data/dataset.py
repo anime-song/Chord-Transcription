@@ -238,6 +238,18 @@ class ChordDataset(Dataset):
         self.stem_order = self.data_cfg["stem_order"]
         self.random_crop = random_crop
 
+        # キー転調点中心サンプリング（random_crop時のみ有効）
+        kts_cfg = self.data_cfg.get("key_transition_sampling", {"enabled": False})
+        self.key_transition_sampling_enabled = bool(kts_cfg.get("enabled", False)) and self.random_crop
+        self.key_transition_sampling_prob = float(np.clip(float(kts_cfg.get("p", 0.35)), 0.0, 1.0))
+        self.key_transition_sampling_jitter_sec = max(0.0, float(kts_cfg.get("jitter_sec", 8.0)))
+        self.key_transition_cache: Dict[str, List[float]] = {}
+        if self.key_transition_sampling_enabled:
+            print(
+                "Key transition sampling enabled: "
+                f"p={self.key_transition_sampling_prob}, jitter={self.key_transition_sampling_jitter_sec}s"
+            )
+
         # ステム拡張の設定
         self.stem_aug_cfg = self.data_cfg.get("stem_augmentation", {"enabled": False})
         self.stem_aug_enabled = self.stem_aug_cfg.get("enabled", False) and self.random_crop
@@ -562,13 +574,76 @@ class ChordDataset(Dataset):
         record = self.records[record_idx]
 
         if self.random_crop:
-            segment_start_sec = np.random.randint(0, max(total_sec - self.segment_seconds, 1))
+            use_transition_sampling = (
+                self.key_transition_sampling_enabled and random.random() < self.key_transition_sampling_prob
+            )
+            if use_transition_sampling:
+                transitions = self._get_key_transition_times(record)
+                segment_start_sec = self._sample_transition_centered_start(total_sec, transitions)
+            else:
+                segment_start_sec = self._sample_uniform_start(total_sec)
         else:
             start_index_of_group = self.cumulative_segments[record_group_idx]
             local_segment_idx = index - start_index_of_group
             segment_start_sec = float(local_segment_idx * self.segment_seconds)
 
         return record, segment_start_sec
+
+    def _sample_uniform_start(self, total_sec: float) -> float:
+        """区間 [0, total_sec - segment_seconds] から一様サンプリングする。"""
+        max_start = max(float(total_sec - self.segment_seconds), 0.0)
+        if max_start <= 0.0:
+            return 0.0
+        return float(np.random.uniform(0.0, max_start))
+
+    def _sample_transition_centered_start(self, total_sec: float, transition_times: List[float]) -> float:
+        """転調時刻付近を中心に切り出し開始位置をサンプリングする。"""
+        max_start = max(float(total_sec - self.segment_seconds), 0.0)
+        if max_start <= 0.0 or not transition_times:
+            return self._sample_uniform_start(total_sec)
+
+        center = float(random.choice(transition_times))
+        jitter = float(
+            np.random.uniform(-self.key_transition_sampling_jitter_sec, self.key_transition_sampling_jitter_sec)
+        )
+        start = center + jitter - (self.segment_seconds * 0.5)
+        return float(np.clip(start, 0.0, max_start))
+
+    def _get_key_transition_times(self, record: Dict[str, Any]) -> List[float]:
+        """レコードのキーイベントから、ラベル遷移時刻を取得（クラス変化のみ）。"""
+        key_label_path = str(record.get("key_label_path", ""))
+        if not key_label_path:
+            return []
+
+        cached = self.key_transition_cache.get(key_label_path)
+        if cached is not None:
+            return cached
+
+        try:
+            events = read_tsv(Path(key_label_path))
+        except Exception as e:
+            print(f"Warning: Failed to read key label file '{key_label_path}': {e}")
+            self.key_transition_cache[key_label_path] = []
+            return []
+
+        if len(events) < 2:
+            self.key_transition_cache[key_label_path] = []
+            return []
+
+        events = sorted(events, key=lambda e: (float(e.start_time), float(e.end_time)))
+        transition_times: List[float] = []
+        non_key_idx = self.key_to_index.get("N", 0)
+        prev_idx = self.key_to_index.get(events[0].label, 0)
+        for event in events[1:]:
+            cur_idx = self.key_to_index.get(event.label, 0)
+            if cur_idx != prev_idx:
+                # 終端などで発生する「有効キー -> N」は転調点サンプリングから除外する
+                if not (prev_idx != non_key_idx and cur_idx == non_key_idx):
+                    transition_times.append(float(event.start_time))
+            prev_idx = cur_idx
+
+        self.key_transition_cache[key_label_path] = transition_times
+        return transition_times
 
     @staticmethod
     def _load_jsonl(path: Path) -> List[Dict]:

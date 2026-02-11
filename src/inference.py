@@ -14,16 +14,22 @@ from .transcribers.base_transcriber import AudioTranscriber, load_config
 
 
 def process_predictions_to_events(
-    predictions: Dict[str, Any], min_duration_chord: float = 0.1, min_duration_key: float = 0.5
+    predictions: Dict[str, Any],
+    min_duration_chord: float = 0.1,
+    min_duration_key: float = 0.5,
+    min_duration_tempo: float = 2.0,
+    tempo_change_ratio: float = 0.05,
+    tempo_change_bpm: float = 4.0,
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
-    フレームごとの予測結果を、コード・キー・セクションのイベントに変換する。
+    フレームごとの予測結果を、コード・キー・テンポのイベントに変換する。
     """
     # フレームごとの予測データを抽出
     frame_times = predictions.get("time_sec")
     root_chords = predictions.get("root_chord", [])
     basses = predictions.get("bass", [])
     keys = predictions.get("key", [])
+    tempos = predictions.get("tempo_bpm", [])
 
     if frame_times is None:
         return [], [], []
@@ -41,6 +47,7 @@ def process_predictions_to_events(
 
     chord_events: List[Dict] = []
     key_events: List[Dict] = []
+    tempo_events: List[Dict] = []
 
     # コードイベントの処理
     if root_chords and basses:
@@ -123,6 +130,60 @@ def process_predictions_to_events(
                     filtered.append(event)
         return filtered
 
+    def filter_tempo_events(events: List[Dict], min_dur: float, merge_bpm: float) -> List[Dict]:
+        if not events:
+            return []
+        filtered: List[Dict] = []
+        for event in events:
+            duration = float(event["end_time"] - event["start_time"])
+            if duration < min_dur and filtered:
+                filtered[-1]["end_time"] = event["end_time"]
+                continue
+
+            if filtered:
+                prev_tempo = float(filtered[-1]["tempo"])
+                curr_tempo = float(event["tempo"])
+                if abs(curr_tempo - prev_tempo) <= merge_bpm:
+                    filtered[-1]["end_time"] = event["end_time"]
+                    continue
+
+            filtered.append(dict(event))
+        return filtered
+
+    # テンポイベントの処理
+    if tempos:
+        limit = min(len(tempos), num_frames)
+        if limit > 0:
+            segment_start_time = frame_times[0]
+            segment_tempos: List[float] = [float(tempos[0])]
+
+            for i in range(1, limit):
+                current_tempo = float(tempos[i])
+                if not np.isfinite(current_tempo):
+                    continue
+
+                representative = float(np.median(segment_tempos)) if segment_tempos else current_tempo
+                threshold = max(float(tempo_change_bpm), abs(representative) * float(tempo_change_ratio))
+
+                if abs(current_tempo - representative) >= threshold:
+                    tempo_events.append(
+                        {
+                            "start_time": segment_start_time,
+                            "end_time": frame_times[i],
+                            "tempo": round(representative, 2),
+                        }
+                    )
+                    segment_start_time = frame_times[i]
+                    segment_tempos = [current_tempo]
+                else:
+                    segment_tempos.append(current_tempo)
+
+            representative = float(np.median(segment_tempos)) if segment_tempos else float(tempos[limit - 1])
+            end_time = frame_times[limit - 1] + frame_duration
+            tempo_events.append(
+                {"start_time": segment_start_time, "end_time": end_time, "tempo": round(representative, 2)}
+            )
+
     # フィルタリング適用
     if min_duration_chord > 0:
         chord_events = filter_events(chord_events, min_duration_chord, "chord")
@@ -130,7 +191,10 @@ def process_predictions_to_events(
     if min_duration_key > 0:
         key_events = filter_events(key_events, min_duration_key, "key")
 
-    return chord_events, key_events
+    if min_duration_tempo > 0:
+        tempo_events = filter_tempo_events(tempo_events, min_duration_tempo, merge_bpm=max(1.0, tempo_change_bpm / 2))
+
+    return chord_events, key_events, tempo_events
 
 
 def save_events_tsv(events: List[Dict], output_path: Path, headers: List[str]) -> None:
@@ -246,6 +310,24 @@ def main():
         default=2.0,
         help="キーイベントの最小継続時間(秒)。これより短いイベントは前のイベントに結合されます。",
     )
+    parser.add_argument(
+        "--min_duration_tempo",
+        type=float,
+        default=2.0,
+        help="テンポイベントの最小継続時間(秒)。これより短いイベントは前のイベントに結合されます。",
+    )
+    parser.add_argument(
+        "--tempo_change_ratio",
+        type=float,
+        default=0.05,
+        help="テンポ変化判定の相対しきい値。例: 0.05 なら約5%以上の変化を境界候補にします。",
+    )
+    parser.add_argument(
+        "--tempo_change_bpm",
+        type=float,
+        default=4.0,
+        help="テンポ変化判定の絶対しきい値(BPM)。",
+    )
     args = parser.parse_args()
 
     try:
@@ -266,8 +348,13 @@ def main():
 
         # フレームごとの予測をイベント（コードチェンジ、キーチェンジ）に変換
         if predictions:
-            chord_events, key_events = process_predictions_to_events(
-                predictions, min_duration_chord=args.min_duration_chord, min_duration_key=args.min_duration_key
+            chord_events, key_events, tempo_events = process_predictions_to_events(
+                predictions,
+                min_duration_chord=args.min_duration_chord,
+                min_duration_key=args.min_duration_key,
+                min_duration_tempo=args.min_duration_tempo,
+                tempo_change_ratio=args.tempo_change_ratio,
+                tempo_change_bpm=args.tempo_change_bpm,
             )
 
             # 結果の表示と保存
@@ -289,6 +376,11 @@ def main():
                 print_events_preview(key_events, "Key")
                 key_output_path = output_dir / f"{audio_path.stem}.key.txt"
                 save_events_tsv(key_events, key_output_path, ["start_time", "end_time", "key"])
+
+            if tempo_events:
+                print_events_preview(tempo_events, "Tempo")
+                tempo_output_path = output_dir / f"{audio_path.stem}.tempo.txt"
+                save_events_tsv(tempo_events, tempo_output_path, ["start_time", "end_time", "tempo"])
 
         else:
             print("[ERROR] 予測を生成できませんでした。")

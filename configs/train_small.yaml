@@ -22,6 +22,10 @@ data_loader:
   stem_order: ["vocals", "drums", "bass", "other", "piano", "guitar"]
   pin_memory: false
   drop_last: false
+  key_transition_sampling:
+    enabled: true
+    p: 0.35
+    jitter_sec: 8.0
 
   pitch_augmentation:
     enabled: true
@@ -102,6 +106,7 @@ base_model_training:
 
   loss:
     ce_ignore_index: -100
+    tempo_regression_scale: "linear"  # "log" | "linear"
     boundary_pos_weight: 5.0       # ShiftTolerantBCELoss の positive weight（不均衡なら>1）
     boundary_tolerance: 1         # ShiftTolerantBCELoss の許容シフト幅
     structure_boundary_pos_weight: 60.0
@@ -110,6 +115,20 @@ base_model_training:
     focal_tversky:
       alpha: 0.3                    # Tversky index の alpha
       gamma: 1.5                   # Focal Tversky Loss の gamma
+    key_transition_emphasis:
+      enabled: true
+      transition_weight: 4.0
+      transition_tolerance_frames: 32
+      base_weight: 1.0
+      non_key_index: 0
+      ignore_non_key_to_n: true
+    segment_consistency:
+      enabled: false
+      heads: ["root_chord", "bass"]
+      length_weighted: true
+      weights:
+        root_chord: 0.1
+        bass: 0.1
 
     weights:
       root_chord: 0.1
@@ -127,3 +146,8 @@ segment_decode:
   nms_window_radius: 3
   min_segment_length: 4
   max_segments: null
+
+tempo_decode:
+  regression_scale: "linear"       # "log" | "linear"
+  bpm_min: 30.0
+  bpm_max: 300.0

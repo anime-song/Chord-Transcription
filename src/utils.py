@@ -18,7 +18,7 @@ from .models.transcription_model import (
     AudioFeatureExtractor,
     MusicStructureTranscriptionModel,
 )
-from .models.segment_model import SegmentTranscriptionModel
+from .models.segment_model import SegmentTranscriptionModel, resolve_segment_decode_params
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
@@ -205,6 +205,7 @@ def build_model_from_config(
 
     if use_segment_model:
         seg_conf = model_cfg["segment"]
+        segment_decode_params = resolve_segment_decode_params(cfg.get("segment_decode", {}))
 
         return SegmentTranscriptionModel(
             **common_kwargs,
@@ -212,6 +213,10 @@ def build_model_from_config(
             transformer_num_heads=seg_conf["num_heads"],
             transformer_num_layers=seg_conf["num_layers"],
             segment_augment_params=seg_conf.get("segment_augment_params", {}),
+            segment_threshold=segment_decode_params["threshold"],
+            segment_nms_window_radius=segment_decode_params["nms_window_radius"],
+            segment_min_segment_length=segment_decode_params["min_segment_length"],
+            segment_max_segments=segment_decode_params["max_segments"],
         )
     return BaseTranscriptionModel(**common_kwargs)
 
