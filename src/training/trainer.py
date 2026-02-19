@@ -242,6 +242,8 @@ class Trainer:
     def _validate_epoch(self, epoch: int) -> Dict[str, float]:
         """1エポック分の検証処理。"""
         self.model.eval()
+        running_losses = {}
+        running_ema_losses = {}
         running_metrics = {}
         running_ema = {}
         usage_accum: Optional[torch.Tensor] = None
@@ -254,6 +256,29 @@ class Trainer:
             with torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                 outputs = self.model(batch["audio"])
                 ema_outputs = self.ema.module(batch["audio"])
+
+                # ロス計算
+                losses = compute_losses(
+                    outputs, batch, self.loss_cfg,
+                    root_chord_loss_fn=self.root_chord_loss_fn,
+                    segment_decode_cfg=self.segment_decode_cfg,
+                )
+                for k, v in losses.items():
+                    running_losses.setdefault(k, 0.0)
+                    running_losses[k] += v.item()
+                running_losses.setdefault("total", 0.0)
+                running_losses["total"] += sum(v.item() for v in losses.values())
+
+                ema_losses = compute_losses(
+                    ema_outputs, batch, self.loss_cfg,
+                    root_chord_loss_fn=self.root_chord_loss_fn,
+                    segment_decode_cfg=self.segment_decode_cfg,
+                )
+                for k, v in ema_losses.items():
+                    running_ema_losses.setdefault(f"ema_{k}", 0.0)
+                    running_ema_losses[f"ema_{k}"] += v.item()
+                running_ema_losses.setdefault("ema_total", 0.0)
+                running_ema_losses["ema_total"] += sum(v.item() for v in ema_losses.values())
 
             usage = outputs.get("repeat/sec_type_usage")
             if usage is not None:
@@ -275,14 +300,17 @@ class Trainer:
                 running_ema[f"ema_{k}"] += v.item()
 
         denom = len(self.valid_loader)
-        epoch_metrics = {k: v / denom for k, v in running_metrics.items()}
-        epoch_metrics.update({k: v / denom for k, v in running_ema.items()})
+        # ロスとメトリクスをまとめる
+        epoch_results = {k: v / denom for k, v in running_losses.items()}
+        epoch_results.update({k: v / denom for k, v in running_ema_losses.items()})
+        epoch_results.update({k: v / denom for k, v in running_metrics.items()})
+        epoch_results.update({k: v / denom for k, v in running_ema.items()})
 
         if usage_accum is not None and usage_count > 0:
             mean_usage = usage_accum / usage_count
             for idx, value in enumerate(mean_usage.tolist()):
                 self.writer.add_scalar(f"Valid/section_type_usage/{idx}", value, epoch)
-        return epoch_metrics
+        return epoch_results
 
     def _save_checkpoint(self, epoch: int):
         """モデルのチェックポイントを保存します。"""
