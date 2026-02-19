@@ -402,6 +402,7 @@ class BaseTranscriptionModel(nn.Module):
         chord25_hidden = 25 + 12
         self.chord25_head = nn.Sequential(nn.Linear(hidden_size, chord25_hidden))
         self.boundary_head = nn.Linear(hidden_size, 1)
+        self.key_boundary_head = nn.Linear(hidden_size, 1)
         self.key_head = nn.Linear(hidden_size, num_key_classes)
         self.bass_head = nn.Linear(hidden_size, num_bass_classes)
 
@@ -448,6 +449,7 @@ class BaseTranscriptionModel(nn.Module):
             "initial_key_logits": self.key_head(features),
             "initial_tempo": self.tempo_head(features),
             "initial_boundary_logits": self.boundary_head(features),
+            "initial_key_boundary_logits": self.key_boundary_head(features),
             "initial_bass_logits": self.bass_head(features),
         }
 

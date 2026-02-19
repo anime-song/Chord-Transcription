@@ -422,6 +422,18 @@ def compute_losses(
         )
         all_losses[f"{stage}/boundary"] = loss * weights.get("boundary", 1.0)
 
+    # --- キーバウンダリ検出タスク ---
+    if f"{stage}_key_boundary_logits" in outputs and "key_boundary" in batch:
+        key_bce_loss_fn = ShiftTolerantBCELoss(
+            pos_weight=loss_cfg.get("key_boundary_pos_weight", 30.0),
+            tolerance=loss_cfg.get("key_boundary_tolerance", 1),
+        )
+        loss = key_bce_loss_fn(
+            preds=outputs[f"{stage}_key_boundary_logits"][..., 0],
+            targets=batch["key_boundary"][..., 0],
+        )
+        all_losses[f"{stage}/key_boundary"] = loss * weights.get("key_boundary", 1.0)
+
     # --- テンポタスク ---
     if f"{stage}_tempo" in outputs:
         tempo_output = outputs[f"{stage}_tempo"]

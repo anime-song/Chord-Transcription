@@ -238,17 +238,8 @@ class ChordDataset(Dataset):
         self.stem_order = self.data_cfg["stem_order"]
         self.random_crop = random_crop
 
-        # キー転調点中心サンプリング（random_crop時のみ有効）
-        kts_cfg = self.data_cfg.get("key_transition_sampling", {"enabled": False})
-        self.key_transition_sampling_enabled = bool(kts_cfg.get("enabled", False)) and self.random_crop
-        self.key_transition_sampling_prob = float(np.clip(float(kts_cfg.get("p", 0.35)), 0.0, 1.0))
-        self.key_transition_sampling_jitter_sec = max(0.0, float(kts_cfg.get("jitter_sec", 8.0)))
-        self.key_transition_cache: Dict[str, List[float]] = {}
-        if self.key_transition_sampling_enabled:
-            print(
-                "Key transition sampling enabled: "
-                f"p={self.key_transition_sampling_prob}, jitter={self.key_transition_sampling_jitter_sec}s"
-            )
+        # コードチェンジ中心サンプリング用キャッシュ（random_crop時のみ使用）
+        self.chord_change_cache: Dict[str, List[float]] = {}
 
         # ステム拡張の設定
         self.stem_aug_cfg = self.data_cfg.get("stem_augmentation", {"enabled": False})
@@ -426,6 +417,7 @@ class ChordDataset(Dataset):
 
         chord25_frames = self.label_processor.chords_to_25d_frames(chord_events, num_frames, segment_start_sec)
         boundary_frames = self.label_processor.chords_to_boundary_frames(chord_events, num_frames, segment_start_sec)
+        key_boundary_frames = self.label_processor.sections_to_boundary_frames(key_spans, num_frames, segment_start_sec)
 
         batch = {
             "audio": torch.from_numpy(audio),
@@ -436,6 +428,7 @@ class ChordDataset(Dataset):
             "tempo_value": torch.from_numpy(tempo_frames),
             "chord25": torch.from_numpy(chord25_frames),
             "boundary": torch.from_numpy(boundary_frames),
+            "key_boundary": torch.from_numpy(key_boundary_frames),
         }
 
         # 音楽構造のフレーム生成 (Function & Boundary)
@@ -574,14 +567,8 @@ class ChordDataset(Dataset):
         record = self.records[record_idx]
 
         if self.random_crop:
-            use_transition_sampling = (
-                self.key_transition_sampling_enabled and random.random() < self.key_transition_sampling_prob
-            )
-            if use_transition_sampling:
-                transitions = self._get_key_transition_times(record)
-                segment_start_sec = self._sample_transition_centered_start(total_sec, transitions)
-            else:
-                segment_start_sec = self._sample_uniform_start(total_sec)
+            change_times = self._get_chord_change_times(record)
+            segment_start_sec = self._sample_chord_change_start(total_sec, change_times)
         else:
             start_index_of_group = self.cumulative_segments[record_group_idx]
             local_segment_idx = index - start_index_of_group
@@ -589,61 +576,50 @@ class ChordDataset(Dataset):
 
         return record, segment_start_sec
 
-    def _sample_uniform_start(self, total_sec: float) -> float:
-        """区間 [0, total_sec - segment_seconds] から一様サンプリングする。"""
+    def _sample_chord_change_start(self, total_sec: float, change_times: List[float]) -> float:
+        """コードチェンジ時刻をセグメント開始位置として返す。"""
         max_start = max(float(total_sec - self.segment_seconds), 0.0)
         if max_start <= 0.0:
             return 0.0
-        return float(np.random.uniform(0.0, max_start))
+        if not change_times:
+            # コードチェンジがない曲はフォールバックで一様サンプリング
+            return float(np.random.uniform(0.0, max_start))
 
-    def _sample_transition_centered_start(self, total_sec: float, transition_times: List[float]) -> float:
-        """転調時刻付近を中心に切り出し開始位置をサンプリングする。"""
-        max_start = max(float(total_sec - self.segment_seconds), 0.0)
-        if max_start <= 0.0 or not transition_times:
-            return self._sample_uniform_start(total_sec)
-
-        center = float(random.choice(transition_times))
-        jitter = float(
-            np.random.uniform(-self.key_transition_sampling_jitter_sec, self.key_transition_sampling_jitter_sec)
-        )
-        start = center + jitter - (self.segment_seconds * 0.5)
+        start = float(random.choice(change_times))
         return float(np.clip(start, 0.0, max_start))
 
-    def _get_key_transition_times(self, record: Dict[str, Any]) -> List[float]:
-        """レコードのキーイベントから、ラベル遷移時刻を取得（クラス変化のみ）。"""
-        key_label_path = str(record.get("key_label_path", ""))
-        if not key_label_path:
+    def _get_chord_change_times(self, record: Dict[str, Any]) -> List[float]:
+        """コードラベルからコードが変化する時刻のリストを取得する（キャッシュ付き）。"""
+        chord_label_path = str(record.get("chord_label_path", ""))
+        if not chord_label_path:
             return []
 
-        cached = self.key_transition_cache.get(key_label_path)
+        cached = self.chord_change_cache.get(chord_label_path)
         if cached is not None:
             return cached
 
         try:
-            events = read_tsv(Path(key_label_path))
+            events = read_chords_jsonl(Path(chord_label_path))
         except Exception as e:
-            print(f"Warning: Failed to read key label file '{key_label_path}': {e}")
-            self.key_transition_cache[key_label_path] = []
+            print(f"Warning: Failed to read chord label file '{chord_label_path}': {e}")
+            self.chord_change_cache[chord_label_path] = []
             return []
 
         if len(events) < 2:
-            self.key_transition_cache[key_label_path] = []
+            self.chord_change_cache[chord_label_path] = []
             return []
 
-        events = sorted(events, key=lambda e: (float(e.start_time), float(e.end_time)))
-        transition_times: List[float] = []
-        non_key_idx = self.key_to_index.get("N", 0)
-        prev_idx = self.key_to_index.get(events[0].label, 0)
+        events = sorted(events, key=lambda e: e.start_time)
+        change_times: List[float] = []
+        prev = events[0]
         for event in events[1:]:
-            cur_idx = self.key_to_index.get(event.label, 0)
-            if cur_idx != prev_idx:
-                # 終端などで発生する「有効キー -> N」は転調点サンプリングから除外する
-                if not (prev_idx != non_key_idx and cur_idx == non_key_idx):
-                    transition_times.append(float(event.start_time))
-            prev_idx = cur_idx
+            # root bass または quality が変わった時点をコードチェンジとみなす
+            if event.root != prev.root or event.bass != prev.bass or event.quality != prev.quality:
+                change_times.append(float(event.start_time))
+            prev = event
 
-        self.key_transition_cache[key_label_path] = transition_times
-        return transition_times
+        self.chord_change_cache[chord_label_path] = change_times
+        return change_times
 
     @staticmethod
     def _load_jsonl(path: Path) -> List[Dict]:

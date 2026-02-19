@@ -22,10 +22,6 @@ data_loader:
   stem_order: ["vocals", "drums", "bass", "other", "piano", "guitar"]
   pin_memory: false
   drop_last: false
-  key_transition_sampling:
-    enabled: true
-    p: 0.35
-    jitter_sec: 8.0
 
   pitch_augmentation:
     enabled: true
@@ -35,7 +31,7 @@ data_loader:
   stem_augmentation:
     enabled: true
     dropout:
-      p: 0.5  # 50%の確率でステム・ドロップアウトを適用
+      p: 0.0  # ステム・ドロップアウトを適用しない
       min_stems: 2
 
     mixing:
@@ -111,6 +107,8 @@ base_model_training:
     boundary_tolerance: 1         # ShiftTolerantBCELoss の許容シフト幅
     structure_boundary_pos_weight: 60.0
     structure_boundary_tolerance: 1
+    key_boundary_pos_weight: 30.0
+    key_boundary_tolerance: 4
     balanced_softmax_tau: 0.3
     focal_tversky:
       alpha: 0.3                    # Tversky index の alpha
@@ -138,6 +136,7 @@ base_model_training:
       tempo: 0.1
       chord25: 10.0
       smooth_chord25: 10.0
+      key_boundary: 3.0
 
 segment_decode:
   enabled: false
