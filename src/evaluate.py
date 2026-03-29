@@ -22,23 +22,25 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 import librosa
-import matplotlib
 import numpy as np
 import soundfile as sf
 import torch
-
-# Use Agg backend for non-interactive plotting
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import yaml
 
 try:
     from tqdm.auto import tqdm
 except ImportError:
     tqdm = None
 
-from src.data.dataset import read_chords_jsonl, read_tsv
-from src.data.processing import ChordEvent, EventSpan
-from src.utils import build_label_processor, build_model_from_config, load_config
+from .data.dataset import read_chords_jsonl, read_tsv
+from .data.processing import ChordEvent, EventSpan
+from .data.processing import LabelProcessor
+from .chord_transcription.models.factory import (
+    build_model_from_config,
+    load_label_vocab_from_checkpoint,
+    load_model_build_config_from_checkpoint,
+    merge_model_build_config,
+)
 from dlchordx import Tone
 
 # Constants
@@ -74,20 +76,20 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Sort per-song output by key accuracy (lowest first).",
     )
-    parser.add_argument(
-        "--use-segment-model",
-        action="store_true",
-        help="Use SegmentTranscriptionModel instead of BaseTranscriptionModel.",
-    )
     return parser.parse_args()
 
 
-def load_full_stems(
+def load_config(config_path: Path) -> Dict[str, Any]:
+    with config_path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def load_full_audio_mix(
     stems_dir: Path,
     sample_rate: int,
     stem_order: Iterable[str],
 ) -> np.ndarray:
-    """Load every stem for the song, resample to `sample_rate`, and stack into (channels, samples)."""
+    """Load every stem for the song, resample to `sample_rate`, and sum them into stereo mix."""
     waves: List[np.ndarray] = []
     max_len = 0
 
@@ -105,7 +107,9 @@ def load_full_stems(
             audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
 
         if audio.shape[0] == 1:
-            audio = np.repeat(audio, 2, axis=0)  # enforce stereo per stem
+            audio = np.repeat(audio, 2, axis=0)
+        elif audio.shape[0] > 2:
+            audio = audio[:2]
 
         waves.append(audio)
         max_len = max(max_len, audio.shape[1])
@@ -120,7 +124,7 @@ def load_full_stems(
             w = w[:, :max_len]
         padded.append(w)
 
-    return np.concatenate(padded, axis=0)
+    return np.sum(np.stack(padded, axis=0), axis=0, dtype=np.float32)
 
 
 def tone_to_index(note: str) -> int:
@@ -149,17 +153,12 @@ def events_to_key_spans(events: List[EventSpan], key_map: Dict[str, int]) -> Lis
 
 
 def build_quality_maps(
-    quality_json: Path, num_quality_classes: int
+    quality_labels: List[str], num_quality_classes: int
 ) -> Tuple[Dict[str, int], List[str], int, List[int]]:
-    with quality_json.open("r", encoding="utf-8") as f:
-        index_to_quality = json.load(f)
-
-    quality_labels: List[str] = []
-    for idx in range(num_quality_classes):
-        key = str(idx)
-        if key not in index_to_quality:
-            raise KeyError(f"quality label index {idx} missing in {quality_json}")
-        quality_labels.append(index_to_quality[key])
+    if len(quality_labels) != num_quality_classes:
+        raise ValueError(
+            f"quality vocabulary size mismatch (expected {num_quality_classes}, got {len(quality_labels)})."
+        )
 
     quality_to_index = {label: idx for idx, label in enumerate(quality_labels)}
     try:
@@ -296,6 +295,14 @@ def decompose_root_chord(
 
 
 def plot_confusion_matrices(counts: np.ndarray, normalized: np.ndarray, labels: List[str], output_path: Path) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError("quality confusion matrix の描画には matplotlib が必要です") from exc
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig_width = max(14.0, len(labels) * 0.25)
     fig, axes = plt.subplots(1, 2, figsize=(fig_width, fig_width * 0.6), sharey=True)
@@ -412,16 +419,23 @@ def write_chord_events(events: List[Dict[str, Any]], output_path: Path) -> None:
 def main() -> None:
     args = parse_args()
     config = load_config(Path(args.config))
+    checkpoint = torch.load(Path(args.checkpoint), map_location="cpu", weights_only=False)
+    saved_model_config = load_model_build_config_from_checkpoint(checkpoint)
+    if saved_model_config is not None:
+        config = merge_model_build_config(config, saved_model_config)
+        print(f"[INFO] Using model config embedded in checkpoint: {args.checkpoint}")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"[INFO] Evaluating on device: {device}")
 
-    label_processor = build_label_processor(config)
+    label_processor = LabelProcessor(
+        sample_rate=config["data_loader"]["sample_rate"],
+        hop_length=config["model"]["backbone"]["hop_length"],
+        n_fft=config["model"]["backbone"]["n_fft"],
+    )
     ignore_index = label_processor.ignore_index
     hop_seconds = label_processor.hop_sec
 
-    # Support segment model loading
-    model = build_model_from_config(config, use_segment_model=args.use_segment_model).to(device)
-    checkpoint = torch.load(Path(args.checkpoint), map_location=device)
+    model = build_model_from_config(config).to(device)
     state_dict = checkpoint.get("ema_state_dict") or checkpoint.get("model_state_dict")
     if state_dict is None:
         raise KeyError("Checkpoint must contain 'ema_state_dict' or 'model_state_dict'.")
@@ -448,8 +462,10 @@ def main() -> None:
     num_root_without_n = num_root_classes - 1
     root_chord_n_index = num_quality_without_nc * num_root_without_n
 
+    label_vocab = load_label_vocab_from_checkpoint(checkpoint)
+    quality_labels = label_vocab["quality"]
     quality_to_index, quality_labels, quality_non_chord_idx, valid_quality_indices = build_quality_maps(
-        Path(data_cfg["quality_json_path"]),
+        quality_labels,
         num_quality_classes,
     )
     root_chord_labels = build_root_chord_labels(num_root_classes, quality_labels)
@@ -512,7 +528,7 @@ def main() -> None:
             basename = record.get("basename") or Path(record["stems_dir"]).name
             stems_dir = Path(record["stems_dir"])
 
-            waveform = load_full_stems(stems_dir, sample_rate, stem_order)
+            waveform = load_full_audio_mix(stems_dir, sample_rate, stem_order)
             num_samples = waveform.shape[-1]
             if num_samples < label_processor.n_fft:
                 print(f"[WARN] Audio too short for STFT (basename={basename}). Skipping.")
@@ -686,10 +702,9 @@ def main() -> None:
     # Sort songs by Key accuracy for the report
     songs_with_key = [s for s in per_song_results if s["metrics"].get("key") is not None]
     songs_with_key.sort(key=lambda s: s["metrics"]["key"])
-    
+
     report["sorted_key_accuracy"] = [
-        {"basename": s["basename"], "accuracy": s["metrics"]["key"]}
-        for s in songs_with_key
+        {"basename": s["basename"], "accuracy": s["metrics"]["key"]} for s in songs_with_key
     ]
 
     output_path = Path(args.output_json)

@@ -96,12 +96,10 @@ def load_validation_basenames(file_path: Path) -> Set[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="chordsの *.jsonl と keys/tempos の *.txt と songs_separated/<basename>/ を突き合わせ、stems_dir を JSONL 出力（ステムは完全一致必須）"
+        description="chords の *.jsonl と keys の *.txt と songs_separated/<basename>/ を突き合わせ、stems_dir を JSONL 出力（ステムは完全一致必須）"
     )
     parser.add_argument("--chords_dir", default="./dataset/chords_normalize", type=Path)
     parser.add_argument("--keys_dir", default="./dataset/keys", type=Path)
-    parser.add_argument("--tempos_dir", default="./dataset/tempos", type=Path)
-    parser.add_argument("--sections_dir", default="./dataset/sections", type=Path)
     parser.add_argument("--songs_separated_dir", default="./dataset/songs_separated", type=Path)
     parser.add_argument("--output_jsonl", default="./pairs.jsonl", type=Path)
     parser.add_argument("--validation_ratio", type=float, default=0.1, help="検証データの比率（0~1）")
@@ -120,15 +118,10 @@ def main() -> None:
 
     chord_index = index_json_labels(args.chords_dir)
     key_index = index_txt_labels(args.keys_dir)
-    tempo_index = index_txt_labels(args.tempos_dir)
-    section_index: Dict[str, Path] = {}
-    sections_dir = args.sections_dir.expanduser() if args.sections_dir is not None else None
-    if sections_dir is not None and sections_dir.exists():
-        section_index = index_txt_labels(sections_dir)
     stem_folder_index = index_subfolders_by_lower_name(args.songs_separated_dir)
 
-    # 3つのラベルが揃っているベース名だけを候補にする
-    candidate_basenames = sorted(set(chord_index) & set(key_index) & set(tempo_index))
+    # chord と key ラベルが揃っているベース名だけを候補にする
+    candidate_basenames = sorted(set(chord_index) & set(key_index))
 
     output_path = args.output_jsonl.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,12 +146,8 @@ def main() -> None:
                 "basename": base,
                 "chord_label_path": str(chord_index[base].resolve()),
                 "key_label_path": str(key_index[base].resolve()),
-                "tempo_label_path": str(tempo_index[base].resolve()),
                 "stems_dir": str(stems_dir.resolve()),
             }
-            section_path = section_index.get(base)
-            if section_path is not None:
-                record["section_label_path"] = str(section_path.resolve())
             matched_records.append(record)
             matched_count += 1
 

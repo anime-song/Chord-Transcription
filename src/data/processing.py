@@ -56,7 +56,9 @@ class LabelProcessor:
         # パディングを考慮しないSTFTのフレーム数計算
         return (num_samples - self.n_fft) // self.hop_length + 1
 
-    def spans_to_frames(self, spans: List[Dict[str, Any]], num_frames: int, seg_start_sec: float) -> np.ndarray:
+    def spans_to_frames(
+        self, spans: List[Dict[str, Any]], num_frames: int, seg_start_sec: float, scale_factor: float = 1.0
+    ) -> np.ndarray:
         """
         時間情報を持つイベントのリスト（spans）をフレーム系列に変換します。
 
@@ -80,8 +82,8 @@ class LabelProcessor:
             event_idx = int(span["idx"])
 
             # イベントの開始・終了時刻を、セグメントの開始時刻からの相対的な秒数に変換
-            start_relative_sec = event_start_sec - seg_start_sec
-            end_relative_sec = event_end_sec - seg_start_sec
+            start_relative_sec = (event_start_sec - seg_start_sec) * scale_factor
+            end_relative_sec = (event_end_sec - seg_start_sec) * scale_factor
 
             # 秒数をフレームインデックスに変換
             # フレームiの開始時刻は i * hop_sec なので、秒数をhop_secで割る
@@ -98,10 +100,11 @@ class LabelProcessor:
 
         return frame_targets
 
-    def spans_to_float_frames(self, spans: List[Dict[str, Any]], num_frames: int, seg_start_sec: float) -> np.ndarray:
+    def spans_to_float_frames(
+        self, spans: List[Dict[str, Any]], num_frames: int, seg_start_sec: float, scale_factor: float = 1.0
+    ) -> np.ndarray:
         """
         【回帰用】浮動小数点数の値を持つイベントをフレーム系列に変換します。
-        (tempo など)
         """
         frame_targets = np.full((num_frames,), self.ignore_index, dtype=np.float32)
         if num_frames == 0:
@@ -110,8 +113,8 @@ class LabelProcessor:
         for span in spans:
             event_value = float(span["value"])
 
-            start_relative_sec = float(span["start_time"]) - seg_start_sec
-            end_relative_sec = float(span["end_time"]) - seg_start_sec
+            start_relative_sec = (float(span["start_time"]) - seg_start_sec) * scale_factor
+            end_relative_sec = (float(span["end_time"]) - seg_start_sec) * scale_factor
 
             start_frame = math.floor(start_relative_sec / self.hop_sec)
             end_frame = math.ceil(end_relative_sec / self.hop_sec)
@@ -159,7 +162,9 @@ class LabelProcessor:
             # Tone()が解析できない音名の場合もゼロベクトルを返す
             return np.zeros(25, dtype=np.float32)
 
-    def chords_to_25d_frames(self, chord_events: List[ChordEvent], num_frames: int, seg_start_sec: float) -> np.ndarray:
+    def chords_to_25d_frames(
+        self, chord_events: List[ChordEvent], num_frames: int, seg_start_sec: float, scale_factor: float = 1.0
+    ) -> np.ndarray:
         """
         ChordEventのリストを、25次元ベクトルで表現されたフレーム系列に変換します。
 
@@ -177,8 +182,8 @@ class LabelProcessor:
             vec25 = self._create_chord_vector(event)
 
             # イベントの時間範囲をフレームインデックスに変換
-            start_relative_sec = event.start_time - seg_start_sec
-            end_relative_sec = event.end_time - seg_start_sec
+            start_relative_sec = (event.start_time - seg_start_sec) * scale_factor
+            end_relative_sec = (event.end_time - seg_start_sec) * scale_factor
 
             start_frame = math.floor(start_relative_sec / self.hop_sec)
             end_frame = math.ceil(end_relative_sec / self.hop_sec)
@@ -193,7 +198,12 @@ class LabelProcessor:
         return frame_targets
 
     def chords_to_boundary_frames(
-        self, chord_events: List[ChordEvent], num_frames: int, seg_start_sec: float, neighbor_weight: float = 0.5
+        self,
+        chord_events: List[ChordEvent],
+        num_frames: int,
+        seg_start_sec: float,
+        neighbor_weight: float = 0.5,
+        scale_factor: float = 1.0,
     ) -> np.ndarray:
         """
         コードイベントのリストから、コードが変化する境界フレームを検出してターゲットを生成します。
@@ -223,7 +233,7 @@ class LabelProcessor:
             for e in chord_events
         ]
 
-        chord_frame_indices = self.spans_to_frames(temp_spans, num_frames, seg_start_sec)
+        chord_frame_indices = self.spans_to_frames(temp_spans, num_frames, seg_start_sec, scale_factor=scale_factor)
 
         # 前後のフレームでコードIDが異なる箇所を境界とする
         boundary = np.zeros(num_frames, dtype=np.float32)
@@ -249,7 +259,12 @@ class LabelProcessor:
         return boundary.reshape(num_frames, 1)
 
     def sections_to_boundary_frames(
-        self, spans: List[Dict[str, Any]], num_frames: int, seg_start_sec: float, neighbor_weight: float = 0.5
+        self,
+        spans: List[Dict[str, Any]],
+        num_frames: int,
+        seg_start_sec: float,
+        neighbor_weight: float = 0.5,
+        scale_factor: float = 1.0,
     ) -> np.ndarray:
         """
         セクションイベントのリストから、セクションが変化する境界フレームを検出してターゲットを生成します。
@@ -258,7 +273,7 @@ class LabelProcessor:
             return np.zeros((0, 1), dtype=np.float32)
 
         # セクションのインデックスフレームを取得
-        section_frame_indices = self.spans_to_frames(spans, num_frames, seg_start_sec)
+        section_frame_indices = self.spans_to_frames(spans, num_frames, seg_start_sec, scale_factor=scale_factor)
 
         # 前後のフレームでセクションIDが異なる箇所を境界とする
         boundary = np.zeros(num_frames, dtype=np.float32)

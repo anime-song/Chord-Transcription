@@ -58,15 +58,14 @@ uv run python -m src.preprocess.normalize_chords --input_dir <input_dir> --outpu
 
 ### Step 4. 学習用ペアの作成
 
-処理済みの音声ファイルと、対応するコード、キー、テンポの各ラベル情報を紐付けたCSVファイル（学習用・検証用ペアリスト）を作成します。
+処理済みの音声ファイルと、対応するコード・キーの各ラベル情報を紐付けたCSVファイル（学習用・検証用ペアリスト）を作成します。
 
 ```bash
-uv run python -m src.preprocess.make_pairs_csv --chords_dir <chords_dir> --keys_dir <keys_dir> --tempos_dir <tempos_dir> --songs_separated_dir <songs_separated_dir> --validation_ratio <validation_ratio>
+uv run python -m src.preprocess.make_pairs_csv --chords_dir <chords_dir> --keys_dir <keys_dir> --songs_separated_dir <songs_separated_dir> --validation_ratio <validation_ratio>
 ```
 
   * `--chords_dir`: 正規化後のコードが保存されているディレクトリ。
   * `--keys_dir`: キー情報が保存されているディレクトリ。
-  * `--tempos_dir`: テンポ情報が保存されているディレクトリ。
   * `--songs_separated_dir`: ステム分離後の音声が保存されているディレクトリ。
   * `--validation_ratio`: 全データのうち、検証用データとして分割する割合。
 
@@ -107,16 +106,30 @@ uv run python -m src.train_segment_transcription --config ./configs/train.yaml -
 
 # 推論
 
-### 1段目のモデルで推論する場合
+### Base モデルで推論する場合
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <base_transcription.pt> --audio <audio_path> --use_hmm
+uv run python -m src.chord_transcription.inference --checkpoint <base_transcription.pt> --audio <audio_path> --decode hmm
 ```
 
-### 2段目のモデルで推論する場合
+### CRF モデルで推論する場合
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --audio <audio_path> --use_segment_model --use_hmm
+uv run python -m src.chord_transcription.inference --checkpoint <crf_model.pt> --audio <audio_path> --decode auto
+```
+
+Python ライブラリとして使う場合の import は `chord_transcription` に寄せています。
+例: `from chord_transcription import TranscriptionPredictor`
+
+例:
+
+```python
+from chord_transcription import TranscriptionPredictor
+
+predictor = TranscriptionPredictor.from_pretrained(
+    "anime-song/Chord-Transcription",
+    filename="model.pt",  # 複数 checkpoint を置く場合は明示
+)
 ```
 
 # 学習済みモデル

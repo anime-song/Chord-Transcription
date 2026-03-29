@@ -71,16 +71,15 @@ uv run python -m src.preprocess.normalize_chords --input_dir <input_dir> --outpu
 
 ### Step 4. Creating Training Pairs
 
-Generates a CSV file (training/validation pair list) that maps processed audio files to their corresponding chord, key, and tempo labels.
+Generates a CSV file (training/validation pair list) that maps processed audio files to their corresponding chord and key labels.
 
 ```bash
-uv run python -m src.preprocess.make_pairs_csv --chords_dir <chords_dir> --keys_dir <keys_dir> --tempos_dir <tempos_dir> --songs_separated_dir <songs_separated_dir> --validation_ratio <validation_ratio>
+uv run python -m src.preprocess.make_pairs_csv --chords_dir <chords_dir> --keys_dir <keys_dir> --songs_separated_dir <songs_separated_dir> --validation_ratio <validation_ratio>
 
 ```
 
 * `--chords_dir`: Directory containing normalized chords.
 * `--keys_dir`: Directory containing key information.
-* `--tempos_dir`: Directory containing tempo information.
 * `--songs_separated_dir`: Directory containing separated stems.
 * `--validation_ratio`: The proportion of the dataset to be used for validation.
 
@@ -130,18 +129,32 @@ uv run python -m src.train_segment_transcription --config ./configs/train.yaml -
 
 # Inference
 
-### Inference with the First-Stage Model
+### Inference with a Base Model
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <base_transcription.pt> --audio <audio_path> --use_hmm
+uv run python -m src.chord_transcription.inference --checkpoint <base_transcription.pt> --audio <audio_path> --decode hmm
 
 ```
 
-### Inference with the Second-Stage Model
+### Inference with a CRF Model
 
 ```bash
-uv run python -m src.inference --config ./configs/train.yaml --checkpoint <segment_model.pt> --audio <audio_path> --use_segment_model --use_hmm
+uv run python -m src.chord_transcription.inference --checkpoint <crf_model.pt> --audio <audio_path> --decode auto
 
+```
+
+Python library imports now live under `chord_transcription`, for example
+`from chord_transcription import TranscriptionPredictor`.
+
+Example:
+
+```python
+from chord_transcription import TranscriptionPredictor
+
+predictor = TranscriptionPredictor.from_pretrained(
+    "anime-song/Chord-Transcription",
+    filename="model.pt",  # required when the repo contains multiple checkpoints
+)
 ```
 
 # Pre-trained Models
