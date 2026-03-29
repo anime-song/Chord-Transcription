@@ -132,6 +132,87 @@ predictor = TranscriptionPredictor.from_pretrained(
 )
 ```
 
+### 学習済み Backbone のファインチューニング
+
+同じアーキテクチャのまま学習を継続するなら `build_model_from_pretrained()` を使います。
+独自の task head を付けたい場合は、モデルを自前で組み立てて `load_pretrained_backbone()` で `backbone.*` だけ読み込みます。
+
+```python
+import torch
+from chord_transcription import build_model_from_pretrained
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = build_model_from_pretrained(
+    "anime-song/Chord-Transcription",
+    filename="model_epoch_150_public.pt",
+    device=device,
+)
+model.train()  # pretrained helper は eval mode で返す
+
+# root_chord / bass head は標準では backbone へ勾配を流しません。
+# それらの loss でも backbone を更新したい場合は False にします。
+model.set_label_head_detach(False)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-2)
+
+outputs = model(waveform)
+loss = your_loss_fn(outputs, batch)
+loss.backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=True)
+```
+
+backbone だけ初期化して新しい head を付けたい場合:
+
+```python
+from chord_transcription import build_model_from_config, load_pretrained_backbone
+
+model = build_model_from_config(cfg).to(device)
+load_pretrained_backbone(
+    model.backbone,
+    "anime-song/Chord-Transcription",
+    filename="model_epoch_150_public.pt",
+)
+model.train()
+```
+
+### Frozen Backbone に対する Linear Probe
+
+backbone を凍結し、抽出したフレーム特徴の上に線形 head だけを学習します。
+
+```python
+import torch
+import torch.nn as nn
+from chord_transcription import build_backbone_from_pretrained
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+backbone = build_backbone_from_pretrained(
+    "anime-song/Chord-Transcription",
+    filename="model_epoch_150_public.pt",
+    device=device,
+)
+for param in backbone.parameters():
+    param.requires_grad = False
+backbone.eval()
+
+probe = nn.Linear(backbone.output_dim, num_labels).to(device)
+optimizer = torch.optim.AdamW(probe.parameters(), lr=1e-3)
+
+with torch.no_grad():
+    features, _ = backbone(waveform)  # features: [B, T, D]
+
+logits = probe(features)  # 例: frame-wise labeling
+loss = criterion(logits.transpose(1, 2), target)
+loss.backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=True)
+```
+
+`Backbone.forward()` は `(features, intermediates)` を返します。
+`features` は最終的なフレーム単位表現で、`intermediates` には各 axial-transformer block 後の出力が入ります。解析や補助 loss に使えます。
+
 # 学習済みモデル
 
 [ここ](https://huggingface.co/anime-song/Chord-Transcription/tree/main)からダウンロードできます。

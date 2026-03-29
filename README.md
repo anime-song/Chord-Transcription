@@ -157,6 +157,87 @@ predictor = TranscriptionPredictor.from_pretrained(
 )
 ```
 
+### Fine-tuning a Pre-trained Backbone
+
+Use `build_model_from_pretrained()` when you want to continue training the same architecture.
+If you want custom task heads, build your own model and load only `backbone.*` weights with `load_pretrained_backbone()`.
+
+```python
+import torch
+from chord_transcription import build_model_from_pretrained
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = build_model_from_pretrained(
+    "anime-song/Chord-Transcription",
+    filename="model_epoch_150_public.pt",
+    device=device,
+)
+model.train()  # the pretrained helper returns the model in eval mode
+
+# root_chord / bass heads are detached from the backbone by default.
+# Disable it if you want those losses to update the backbone as well.
+model.set_label_head_detach(False)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-2)
+
+outputs = model(waveform)
+loss = your_loss_fn(outputs, batch)
+loss.backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=True)
+```
+
+Initialize only the backbone if you want to attach new heads:
+
+```python
+from chord_transcription import build_model_from_config, load_pretrained_backbone
+
+model = build_model_from_config(cfg).to(device)
+load_pretrained_backbone(
+    model.backbone,
+    "anime-song/Chord-Transcription",
+    filename="model_epoch_150_public.pt",
+)
+model.train()
+```
+
+### Linear Probe on a Frozen Backbone
+
+Freeze the backbone and train only a linear head on top of the extracted frame-level features.
+
+```python
+import torch
+import torch.nn as nn
+from chord_transcription import build_backbone_from_pretrained
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+backbone = build_backbone_from_pretrained(
+    "anime-song/Chord-Transcription",
+    filename="model_epoch_150_public.pt",
+    device=device,
+)
+for param in backbone.parameters():
+    param.requires_grad = False
+backbone.eval()
+
+probe = nn.Linear(backbone.output_dim, num_labels).to(device)
+optimizer = torch.optim.AdamW(probe.parameters(), lr=1e-3)
+
+with torch.no_grad():
+    features, _ = backbone(waveform)  # features: [B, T, D]
+
+logits = probe(features)  # example: frame-wise labeling
+loss = criterion(logits.transpose(1, 2), target)
+loss.backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=True)
+```
+
+`Backbone.forward()` returns `(features, intermediates)`.
+`features` is the final frame-level representation, and `intermediates` contains per-block axial-transformer outputs that can be used for analysis or auxiliary losses.
+
 # Pre-trained Models
 
 Available for download [here](https://huggingface.co/anime-song/Chord-Transcription/tree/main).
