@@ -153,7 +153,7 @@ from chord_transcription import TranscriptionPredictor
 
 predictor = TranscriptionPredictor.from_pretrained(
     "anime-song/Chord-Transcription",
-    filename="model.pt",  # required when the repo contains multiple checkpoints
+    filename="model_epoch_150_public.pt",  # required when the repo contains multiple checkpoints
 )
 ```
 
