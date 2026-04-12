@@ -15,24 +15,21 @@ graph TD
     B --> C(Stem Convolution)
     C --> D{Axial RoFormer<br>Time-Band Attention}
     
-    Q1[Pitch Queries] --> D
-    Q2[Interval Queries] --> D
+    Q[Interval Queries] --> D
     
     D --> E1[Band Features]
-    D --> E2[Pitch Query Features]
-    D --> E3[Interval Query Features]
+    D --> E2[Interval Query Features]
     
-    E1 --> H1[Root / Bass / Key / Boundary Heads]
-    E2 --> H2[Chord25 Pitch On/Off Classification]
-    E3 --> H3[Semi-CRF Score Matrices]
+    E1 --> H1[Root / Bass / Key / Boundary / Pitch Chroma Heads]
+    E2 --> H2[Semi-CRF Score Matrices]
     
-    H3 --> CRF((Neural Semi-CRF))
+    H2 --> CRF((Neural Semi-CRF))
     CRF -->|decode| OUT[Chord Intervals]
 ```
 
 The model architecture separates and specializes feature extraction:
 1. **Backbone**: Processes CQT features using Time-Band Axial RoFormer blocks.
-2. **Queries**: Specialized tokens for Pitch (25 types) and Interval scoring are concatenated and passed through the Transformer layers.
+2. **Interval Queries**: Learnable tokens for chord interval scoring are concatenated with band tokens and passed through the Transformer layers.
 3. **Semi-CRF**: Instead of independent frame-by-frame classification, a Neural Semi-CRF predicts the globally optimal sequence of chord intervals.
 
 # Dataset Creation Pipeline
@@ -265,7 +262,7 @@ optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 ```
 
-`Backbone.forward()` returns a `BackboneOutput` object containing `band_features`, `pitch_query_features`, and `interval_query_features` corresponding to the respective attention queries and features.
+`Backbone.forward()` returns a `BackboneOutput` object containing `band_features` and `interval_query_features` corresponding to the band tokens and interval query tokens respectively.
 
 # Pre-trained Models
 

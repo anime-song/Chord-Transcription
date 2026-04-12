@@ -14,24 +14,21 @@ graph TD
     B --> C(Stem Convolution)
     C --> D{Axial RoFormer<br>Time-Band Attention}
     
-    Q1[Pitch Queries] --> D
-    Q2[Interval Queries] --> D
+    Q[Interval Queries] --> D
     
     D --> E1[Band Features]
-    D --> E2[Pitch Query Features]
-    D --> E3[Interval Query Features]
+    D --> E2[Interval Query Features]
     
-    E1 --> H1[Root / Bass / Key / Boundary Heads]
-    E2 --> H2[Chord25 Pitch On/Off Classification]
-    E3 --> H3[Semi-CRF Score Matrices]
+    E1 --> H1[Root / Bass / Key / Boundary / Pitch Chroma Heads]
+    E2 --> H2[Semi-CRF Score Matrices]
     
-    H3 --> CRF((Neural Semi-CRF))
+    H2 --> CRF((Neural Semi-CRF))
     CRF -->|decode| OUT[Chord Intervals]
 ```
 
 本モデルは特徴抽出と予測を専門的に分離しています：
 1. **Backbone**: CQT 特徴量を Time-Band Axial RoFormer ブロックを使用して処理します。
-2. **Queries**: ピッチ予測（25種）およびコード区間スコアのための専用トークンが結合され、Transformer レイヤーを通過します。
+2. **Interval Queries**: コード区間スコアのための学習可能トークンが band tokens と結合され、Transformer レイヤーを通過します。
 3. **Semi-CRF**: フレーム単位の独立した分類ではなく、Neural Semi-CRF を用いてコード区間の最適なシーケンスを予測・最適化します。
 
 # データセット作成パイプライン
@@ -239,7 +236,7 @@ optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 ```
 
-`Backbone.forward()` は各クエリごとに対応した `band_features`, `pitch_query_features`, `interval_query_features` を格納した `BackboneOutput` オブジェクトを返します。
+`Backbone.forward()` は `band_features` と `interval_query_features` を格納した `BackboneOutput` オブジェクトを返します。それぞれ band tokens と interval query tokens に対応しています。
 
 # 学習済みモデル
 
