@@ -3,9 +3,36 @@
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/Chord-Transcription/blob/main/Chord_Transcription.ipynb)
 
-コード採譜モデルを学習するリポジトリ。
+コード採譜モデルを学習するリポジトリです。
+**CQT**、**Axial RoFormer** アーキテクチャ、および **Neural Semi-CRF** を活用して、正確なコード区間と文脈解釈による高精度な推論を実現しています。
 
-SegmentModelによる文脈解釈で高精度な推論が可能です。
+## アーキテクチャ
+
+```mermaid
+graph TD
+    A[Audio Waveform] --> B(CQT Feature Extraction)
+    B --> C(Stem Convolution)
+    C --> D{Axial RoFormer<br>Time-Band Attention}
+    
+    Q1[Pitch Queries] --> D
+    Q2[Interval Queries] --> D
+    
+    D --> E1[Band Features]
+    D --> E2[Pitch Query Features]
+    D --> E3[Interval Query Features]
+    
+    E1 --> H1[Root / Bass / Key / Boundary Heads]
+    E2 --> H2[Chord25 Pitch On/Off Classification]
+    E3 --> H3[Semi-CRF Score Matrices]
+    
+    H3 --> CRF((Neural Semi-CRF))
+    CRF -->|decode| OUT[Chord Intervals]
+```
+
+本モデルは特徴抽出と予測を専門的に分離しています：
+1. **Backbone**: CQT 特徴量を Time-Band Axial RoFormer ブロックを使用して処理します。
+2. **Queries**: ピッチ予測（25種）およびコード区間スコアのための専用トークンが結合され、Transformer レイヤーを通過します。
+3. **Semi-CRF**: フレーム単位の独立した分類ではなく、Neural Semi-CRF を用いてコード区間の最適なシーケンスを予測・最適化します。
 
 # データセット作成パイプライン
 
@@ -90,18 +117,18 @@ uv run python -m src.preprocess.count_quality_freq --data_folder <data_folder> -
 
 
 # 学習
-### Step 1. 1段目のモデル学習
+### Step 1. Base モデルの学習
 
 ```bash
-uv run python -m src.train_transcription --config ./configs/train.yaml
+uv run python -m src.train_transcription --config ./configs/train_large.yaml
 ```
 
-### Step 2. 2段目のモデル学習
+### Step 2. CRF モデルの学習
 
-checkpointには1段目のモデルの重みを指定します。
+checkpointにはBaseモデルの重みを指定します。
 
 ```bash
-uv run python -m src.train_segment_transcription --config ./configs/train.yaml --checkpoint <base_transcription.pt> --training_backbone
+uv run python -m src.train_crf --config ./configs/train_large.yaml --checkpoint <base_transcription.pt> --training_backbone
 ```
 
 # 推論
@@ -109,8 +136,9 @@ uv run python -m src.train_segment_transcription --config ./configs/train.yaml -
 ### Base モデルで推論する場合
 
 ```bash
-uv run python -m src.chord_transcription.inference --checkpoint <base_transcription.pt> --audio <audio_path> --decode hmm
+uv run python -m src.chord_transcription.inference --checkpoint <base_transcription.pt> --audio <audio_path> --decode crf_pool
 ```
+*Note: Base モデルでは `argmax`, `hmm`, `crf_pool` のデコードモードが選択可能です。*
 
 ### CRF モデルで推論する場合
 
@@ -201,17 +229,17 @@ probe = nn.Linear(backbone.output_dim, num_labels).to(device)
 optimizer = torch.optim.AdamW(probe.parameters(), lr=1e-3)
 
 with torch.no_grad():
-    features, _ = backbone(waveform)  # features: [B, T, D]
+    backbone_out = backbone(waveform)
 
-logits = probe(features)  # 例: frame-wise labeling
+# 例: frame-wise labeling に band features を使う
+logits = probe(backbone_out.band_features)
 loss = criterion(logits.transpose(1, 2), target)
 loss.backward()
 optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 ```
 
-`Backbone.forward()` は `(features, intermediates)` を返します。
-`features` は最終的なフレーム単位表現で、`intermediates` には各 axial-transformer block 後の出力が入ります。解析や補助 loss に使えます。
+`Backbone.forward()` は各クエリごとに対応した `band_features`, `pitch_query_features`, `interval_query_features` を格納した `BackboneOutput` オブジェクトを返します。
 
 # 学習済みモデル
 

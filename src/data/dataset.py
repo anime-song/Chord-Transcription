@@ -695,10 +695,7 @@ class ChordDataset(Dataset):
         # mute stem に noise や saturation が乗ると dropout の意味が変わるため、
         # 十分なエネルギーがある stem だけを対象にする。
         if self.waveform_augmentation is not None:
-            stems = [
-                self.waveform_augmentation(stem) if stem_has_energy(stem, 1e-8) else stem
-                for stem in stems
-            ]
+            stems = [self.waveform_augmentation(stem) if stem_has_energy(stem, 1e-8) else stem for stem in stems]
 
         # stem ごとの拡張が終わったら、モデル入力用の stereo mix に落とす。
         audio = mix_stems(stems)

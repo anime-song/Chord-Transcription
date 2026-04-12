@@ -286,7 +286,7 @@ def resolve_audio_source(
                 raise
 
     raise RuntimeError(
-        f"Could not resolve audio source for {task.song_id}. " f"wav_error={wav_error!r}, packed_error={packed_error!r}"
+        f"Could not resolve audio source for {task.song_id}. wav_error={wav_error!r}, packed_error={packed_error!r}"
     )
 
 

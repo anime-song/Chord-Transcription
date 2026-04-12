@@ -41,6 +41,7 @@ from .chord_transcription.models.factory import (
     load_model_build_config_from_checkpoint,
     merge_model_build_config,
 )
+from .chord_transcription.metrics import extract_time_intervals_from_events, segment_f1_score
 from dlchordx import Tone
 
 # Constants
@@ -513,6 +514,7 @@ def main() -> None:
     chord_output_dir.mkdir(parents=True, exist_ok=True)
 
     per_song_results: List[Dict[str, Any]] = []
+    segment_macro_f1_scores: List[float] = []
 
     # Task names for metric reporting
     track_tasks = ["root", "bass", "root_chord", "quality", "key"]
@@ -534,13 +536,13 @@ def main() -> None:
                 print(f"[WARN] Audio too short for STFT (basename={basename}). Skipping.")
                 continue
 
-            chord_events = read_chords_jsonl(Path(record["chord_label_path"]))
+            gt_chord_events = read_chords_jsonl(Path(record["chord_label_path"]))
             key_events = read_tsv(Path(record["key_label_path"]))
 
             num_frames = label_processor.get_num_frames(num_samples)
 
             # Ground Truth Generators
-            root_spans, bass_spans, quality_spans = chord_events_to_index_spans(chord_events, quality_to_index)
+            root_spans, bass_spans, quality_spans = chord_events_to_index_spans(gt_chord_events, quality_to_index)
             key_spans = events_to_key_spans(key_events, key_to_index)
 
             root_frames = label_processor.spans_to_frames(root_spans, num_frames, seg_start_sec=0.0)
@@ -641,17 +643,27 @@ def main() -> None:
             # Generate labels for TSV
             root_chord_label_seq = indices_to_labels(root_chord_preds, root_chord_labels, ignore_index)
             bass_label_seq = indices_to_labels(bass_preds, PITCH_CLASS_LABELS_13, ignore_index)
-            chord_events = build_chord_events(frame_times, hop_seconds, root_chord_label_seq, bass_label_seq)
+            pred_chord_events = build_chord_events(frame_times, hop_seconds, root_chord_label_seq, bass_label_seq)
+            segment_macro_f1_iou_50 = segment_f1_score(
+                extract_time_intervals_from_events(gt_chord_events),
+                extract_time_intervals_from_events(pred_chord_events),
+                iou_threshold=0.5,
+                inclusive_end=False,
+            )
+            segment_macro_f1_scores.append(segment_macro_f1_iou_50)
 
             chord_filename = sanitize_filename(basename) + ".chords.txt"
             chord_path = chord_output_dir / chord_filename
-            write_chord_events(chord_events, chord_path)
+            write_chord_events(pred_chord_events, chord_path)
 
             per_song_results.append(
                 {
                     "basename": basename,
                     "frame_count": int(num_frames),
-                    "metrics": metrics,
+                    "metrics": {
+                        **metrics,
+                        "segment_macro_f1_iou_50": segment_macro_f1_iou_50,
+                    },
                     "chord_path": str(chord_path.resolve()),
                 }
             )
@@ -668,6 +680,11 @@ def main() -> None:
 
     overall_metrics = {
         task: compute_accuracy(overall_counts[task]["correct"], overall_counts[task]["total"]) for task in track_tasks
+    }
+    overall_segment_metrics = {
+        "macro_f1_iou_50": (
+            float(sum(segment_macro_f1_scores) / len(segment_macro_f1_scores)) if segment_macro_f1_scores else None
+        )
     }
     overall_counts_out = {
         task: {"correct": int(values["correct"]), "total": int(values["total"])}
@@ -691,6 +708,7 @@ def main() -> None:
         "validation_jsonl": str(valid_jsonl.resolve()),
         "frame_hop_seconds": hop_seconds,
         "overall": {"accuracy": overall_metrics, "counts": overall_counts_out},
+        "segment_metrics": overall_segment_metrics,
         "per_track": per_song_results,
         "quality_confusion_matrix": {
             "labels": quality_labels,

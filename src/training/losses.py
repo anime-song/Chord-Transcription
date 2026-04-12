@@ -3,6 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Union, List, Optional, Tuple
 
+from ..chord_transcription.metrics import segment_macro_f1_score
+from ..chord_transcription.models.semi_crf import (
+    NeuralSemiCRFInterval,
+    _build_interval_score,
+    _build_length_scale,
+    _zero_noise_score,
+    _sanitize_interval_batch,
+)
+
 
 class BalancedSoftmaxLoss(nn.Module):
     def __init__(self, class_counts: Union[List[int], torch.Tensor], tau: float = 1.0):
@@ -105,39 +114,40 @@ class ShiftTolerantBCELoss(torch.nn.Module):
 
 def tversky_index(y_true: torch.Tensor, y_pred: torch.Tensor, alpha: float = 0.5, smooth: float = 1e-6) -> torch.Tensor:
     """
-    Tversky Indexを計算するヘルパー関数。
+    クラスごとの Tversky Index を計算し、その平均を返す。
 
     Args:
-        y_true (torch.Tensor): 正解ラベル (0 or 1)
-        y_pred (torch.Tensor): 予測確率 (0 to 1)
+        y_true (torch.Tensor): 正解ラベル (B, T, C) — 0 or 1
+        y_pred (torch.Tensor): 予測確率 (B, T, C) — 0 to 1
         alpha (float): FPとFNの重み付けを調整するパラメータ
         smooth (float): ゼロ除算を防ぐための平滑化係数
+
+    Returns:
+        torch.Tensor: クラス平均の Tversky Index (スカラー)
     """
-    # バッチと時間次元をフラット化
-    y_true = y_true.reshape(-1)
-    y_pred = y_pred.reshape(-1)
+    # クラスごとに TP / FP / FN を集計 → [C]
+    tp = (y_true * y_pred).sum(dim=(0, 1))
+    fp = ((1 - y_true) * y_pred).sum(dim=(0, 1))
+    fn = (y_true * (1 - y_pred)).sum(dim=(0, 1))
 
-    # True Positives, False Positives & False Negatives
-    tp = (y_true * y_pred).sum()
-    fp = ((1 - y_true) * y_pred).sum()
-    fn = (y_true * (1 - y_pred)).sum()
-
-    return (tp + smooth) / (tp + alpha * fp + (1 - alpha) * fn + smooth)
+    per_class_ti = (tp + smooth) / (tp + alpha * fp + (1 - alpha) * fn + smooth)
+    return per_class_ti.mean()
 
 
 def focal_tversky_loss(
     y_true: torch.Tensor, y_pred_logits: torch.Tensor, alpha: float = 0.3, gamma: float = 1.5, smooth: float = 1e-6
 ) -> torch.Tensor:
     """
-    PyTorch版 Focal Tversky Loss。
+    PyTorch版 Focal Tversky Loss（クラスごとに計算）。
 
     Args:
-        y_true (torch.Tensor): 正解ラベル (B, T, 25)
-        y_pred_logits (torch.Tensor): モデルからの生の出力 (B, T, 25)
+        y_true (torch.Tensor): 正解ラベル (B, T, 12)
+        y_pred_logits (torch.Tensor): モデルからの生の出力 (B, T, 12)
         alpha (float): Tversky Indexのalpha
         gamma (float): フォーカス係数。1に近いほど損失が大きくなる。
     """
-    ti = tversky_index(y_true, y_pred_logits, alpha=alpha, smooth=smooth)
+    y_pred = torch.sigmoid(y_pred_logits)
+    ti = tversky_index(y_true, y_pred, alpha=alpha, smooth=smooth)
     return torch.pow((1 - ti), gamma)
 
 
@@ -201,143 +211,221 @@ def _filter_logits_and_labels(
     return logits[valid_mask], labels[valid_mask]
 
 
-def _resolve_repeat_sample_mask(
-    batch: Dict[str, torch.Tensor],
-    *,
-    batch_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    sample_mask = batch.get("repeat_loss_mask")
-    if sample_mask is None:
-        return torch.ones((batch_size,), dtype=torch.bool, device=device)
-    return sample_mask.to(device=device, dtype=torch.bool)
-
-
-def _pool_probabilities_by_segments(
-    probabilities: torch.Tensor,
-    segment_starts: torch.Tensor,
-    segment_ends: torch.Tensor,
-    segment_count: int,
-) -> torch.Tensor:
-    """フレーム確率を GT セグメント単位へ平均プーリングする。"""
-    if segment_count <= 0:
-        return probabilities.new_zeros((0, probabilities.shape[-1]))
-
-    pooled_segments = []
-    for segment_idx in range(segment_count):
-        start = int(segment_starts[segment_idx].item())
-        end = int(segment_ends[segment_idx].item())
-        if end <= start:
-            pooled_segments.append(probabilities.new_zeros((probabilities.shape[-1],)))
-            continue
-        pooled_segments.append(probabilities[start:end].mean(dim=0))
-    return torch.stack(pooled_segments, dim=0)
-
-
-def _js_divergence_from_probabilities(
-    probabilities_p: torch.Tensor,
-    probabilities_q: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """確率分布どうしの Jensen-Shannon divergence を要素ごとに返す。"""
-    p = probabilities_p.clamp_min(eps)
-    q = probabilities_q.clamp_min(eps)
-    m = (0.5 * (p + q)).clamp_min(eps)
-    kl_pm = (p * (p.log() - m.log())).sum(dim=-1)
-    kl_qm = (q * (q.log() - m.log())).sum(dim=-1)
-    return 0.5 * (kl_pm + kl_qm)
-
-
-def _compute_repeat_prediction_stats(
-    logits: torch.Tensor,
-    repeat_ssm_output,
-    sample_mask: Optional[torch.Tensor] = None,
-) -> Dict[str, torch.Tensor]:
+def extract_chord_intervals_from_boundary(
+    boundary: torch.Tensor,
+    threshold: float = 0.8,
+) -> List[List[Tuple[int, int]]]:
     """
-    repeat 候補区間どうしで予測分布がどれだけ近いかを集計する。
+    Boundary ラベルからコード区間（開始/終了のペア）を抽出する。
 
-    `ChordWindowSSM` 側で作った sparse pair list を使い、
-    まず GT セグメント単位に pooled してから aligned segment ごとに比較する。
+    boundary の 1.0 はコード変化点（新しいコードの先頭フレーム）を意味する。
+    連続する同一コード区間を closed interval [begin, end] として返す。
+
+    Args:
+        boundary: [B, T, 1] — 0.0/0.5/1.0 の soft boundary ラベル
+        threshold: 境界とみなす閾値（0.8 なら 1.0 のフレームのみ抽出）
+
+    Returns:
+        batch ごとの interval リスト: [[(begin, end), ...], ...]
     """
-    probabilities = F.softmax(logits, dim=-1)
-    batch_size = logits.shape[0]
-    device = logits.device
+    if boundary.dim() == 3:
+        boundary = boundary.squeeze(-1)  # [B, T]
 
-    total_pair_count = logits.new_zeros(())
-    total_aligned_segments = logits.new_zeros(())
-    total_probability_cosine = logits.new_zeros(())
-    total_argmax_match = logits.new_zeros(())
-    total_audio_similarity = logits.new_zeros(())
-    total_span_ratio = logits.new_zeros(())
-    loss_terms = []
-    if sample_mask is None:
-        sample_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
-    valid_batch_count = sample_mask.to(dtype=logits.dtype).sum().clamp_min(1.0)
+    batch_size, time_steps = boundary.shape
+    result: List[List[Tuple[int, int]]] = []
 
     for batch_idx in range(batch_size):
-        if not bool(sample_mask[batch_idx].item()):
-            continue
-        segment_count = int(repeat_ssm_output.segment_counts[batch_idx].item())
-        pair_count = int(repeat_ssm_output.repeat_pair_counts[batch_idx].item())
-        if segment_count == 0 or pair_count == 0:
+        boundary_sample = boundary[batch_idx]  # [T]
+        # 閾値以上のフレームを境界（新コードの先頭）とみなす
+        change_points = (boundary_sample >= threshold).nonzero(as_tuple=False).squeeze(-1)
+
+        intervals: List[Tuple[int, int]] = []
+        if change_points.numel() == 0:
+            # 境界がない = 全体が1区間
+            if time_steps > 0:
+                intervals.append((0, time_steps - 1))
+        else:
+            change_list = change_points.tolist()
+            # 最初の境界より前の区間
+            if change_list[0] > 0:
+                intervals.append((0, change_list[0] - 1))
+            # 各境界間の区間
+            for i in range(len(change_list)):
+                begin = change_list[i]
+                end = change_list[i + 1] - 1 if i + 1 < len(change_list) else time_steps - 1
+                if end >= begin:
+                    intervals.append((begin, end))
+
+        result.append(intervals)
+
+    return result
+
+
+def compute_segment_classification_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    gt_intervals: List[List[Tuple[int, int]]],
+    loss_fn: nn.Module,
+    ignore_index: int,
+) -> torch.Tensor:
+    """
+    GT区間でロジットをプーリング（平均）し、区間中央のラベルに対してロスを計算する。
+    推論時の CRF pool デコードと一貫性を持たせる働きをします。
+
+    Args:
+        logits: (B, T, C)
+        labels: (B, T)
+        gt_intervals: extract_chord_intervals_from_boundary で抽出した区間リスト
+        loss_fn: 適用するロス関数 (CrossEntropyLoss, BalancedSoftmaxLoss など)
+        ignore_index: 無視するラベルのインデックス
+    """
+    batch_size = logits.shape[0]
+    pooled_logits_list = []
+    target_labels_list = []
+
+    for batch_idx in range(batch_size):
+        intervals = gt_intervals[batch_idx]
+        for start, end in intervals:
+            # 区間内のロジットをプーリング（平均）
+            pooled = logits[batch_idx, start : end + 1].mean(dim=0)
+
+            # 区間中央のフレームのラベルを取得
+            mid = (start + end) // 2
+            target = labels[batch_idx, mid]
+
+            pooled_logits_list.append(pooled)
+            target_labels_list.append(target)
+
+    if not pooled_logits_list:
+        return logits.sum() * 0.0
+
+    pooled_logits = torch.stack(pooled_logits_list)  # (N, C)
+    target_labels = torch.stack(target_labels_list)  # (N,)
+
+    # ignore_index のフィルタリング
+    valid_mask = target_labels != ignore_index
+    if not valid_mask.any():
+        return logits.sum() * 0.0
+
+    filtered_logits = pooled_logits[valid_mask]
+    filtered_labels = target_labels[valid_mask]
+
+    loss = loss_fn(filtered_logits, filtered_labels)
+    return loss
+
+
+def compute_chord_interval_loss(
+    interval_query: torch.Tensor,
+    interval_key: torch.Tensor,
+    interval_diag: torch.Tensor,
+    boundary: torch.Tensor,
+    length_scaling: str = "sqrt",
+    boundary_threshold: float = 0.8,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Semi-CRF によるコード区間の NLL loss を計算する。
+
+    Args:
+        interval_query: [B, T, D]
+        interval_key: [B, T, D]
+        interval_diag: [B, T]
+        boundary: [B, T, 1] — GT boundary ラベル
+        length_scaling: interval score のスケーリング方式
+        boundary_threshold: 境界判定の閾値
+
+    Returns:
+        (loss, num_intervals): NLL loss と GT 区間の総数
+    """
+    # GT コード区間を抽出
+    gt_intervals = extract_chord_intervals_from_boundary(
+        boundary,
+        threshold=boundary_threshold,
+    )
+
+    batch_size, time_steps, _ = interval_query.shape
+    total_log_prob = interval_query.new_zeros(())
+    total_samples = 0
+
+    for batch_idx in range(batch_size):
+        intervals = gt_intervals[batch_idx]
+        if not intervals:
             continue
 
-        pooled = _pool_probabilities_by_segments(
-            probabilities=probabilities[batch_idx],
-            segment_starts=repeat_ssm_output.segment_starts[batch_idx],
-            segment_ends=repeat_ssm_output.segment_ends[batch_idx],
-            segment_count=segment_count,
+        # 1サンプル分のスコアテンソルを構築
+        query_single = interval_query[batch_idx].unsqueeze(1)  # [T, 1, D]
+        key_single = interval_key[batch_idx].unsqueeze(1)  # [T, 1, D]
+        diag_single = interval_diag[batch_idx].unsqueeze(1)  # [T, 1]
+
+        score = _build_interval_score(
+            query_single,
+            key_single,
+            diag_single,
+            length_scaling=length_scaling,
         )
-        pair_starts = repeat_ssm_output.repeat_pairs_segment_starts[batch_idx, :pair_count]
-        pair_lengths = repeat_ssm_output.repeat_pairs_lengths[batch_idx, :pair_count]
-        pair_similarity = getattr(repeat_ssm_output, "repeat_pairs_similarity", None)
-        if pair_similarity is not None:
-            pair_similarity = pair_similarity[batch_idx, :pair_count]
-        pair_span_ratio = repeat_ssm_output.repeat_pairs_span_ratio[batch_idx, :pair_count]
 
-        total_pair_count = total_pair_count + pair_count
-        if pair_similarity is not None:
-            total_audio_similarity = total_audio_similarity + pair_similarity.sum()
-        total_span_ratio = total_span_ratio + pair_span_ratio.sum()
+        noise_score = _zero_noise_score(
+            time_steps,
+            batch_size=1,
+            device=score.device,
+        )
 
-        for pair_idx in range(pair_count):
-            start_i = int(pair_starts[pair_idx, 0].item())
-            start_j = int(pair_starts[pair_idx, 1].item())
-            length = int(pair_lengths[pair_idx].item())
-            if length <= 0:
-                continue
+        sanitized = _sanitize_interval_batch([intervals], length=time_steps)
+        semi_crf = NeuralSemiCRFInterval(score, noise_score)
+        log_prob = semi_crf.logProb(sanitized)
+        total_log_prob = total_log_prob + log_prob.sum()
+        total_samples += 1
 
-            seq_i = pooled[start_i : start_i + length]
-            seq_j = pooled[start_j : start_j + length]
-            if seq_i.shape[0] != length or seq_j.shape[0] != length:
-                continue
+    if total_samples <= 0:
+        return interval_query.sum() * 0.0, 0
 
-            cosine = F.cosine_similarity(seq_i, seq_j, dim=-1, eps=1e-8)
-            js_divergence = _js_divergence_from_probabilities(seq_i, seq_j)
-            argmax_match = (seq_i.argmax(dim=-1) == seq_j.argmax(dim=-1)).to(probabilities.dtype)
+    return -total_log_prob / float(total_samples), sum(len(iv) for iv in gt_intervals)
 
-            total_aligned_segments = total_aligned_segments + length
-            total_probability_cosine = total_probability_cosine + cosine.sum()
-            total_argmax_match = total_argmax_match + argmax_match.sum()
-            loss_terms.append(js_divergence)
 
-    if loss_terms:
-        consistency_loss = torch.cat(loss_terms, dim=0).mean()
-    else:
-        consistency_loss = logits.sum() * 0.0
+@torch.no_grad()
+def decode_chord_intervals(
+    interval_query: torch.Tensor,
+    interval_key: torch.Tensor,
+    interval_diag: torch.Tensor,
+    *,
+    length_scaling: str = "sqrt",
+) -> List[List[Tuple[int, int]]]:
+    if interval_query.shape != interval_key.shape:
+        raise ValueError(
+            "interval_query and interval_key must share the same shape, "
+            f"got {tuple(interval_query.shape)} vs {tuple(interval_key.shape)}"
+        )
+    if interval_query.dim() != 3:
+        raise ValueError("interval_query must have shape [B, T, D].")
+    if interval_diag.shape != interval_query.shape[:2]:
+        raise ValueError(
+            "interval_diag must have shape [B, T], "
+            f"got {tuple(interval_diag.shape)} for interval_query {tuple(interval_query.shape)}"
+        )
 
-    safe_pair_count = total_pair_count.clamp_min(1.0)
-    safe_segment_count = total_aligned_segments.clamp_min(1.0)
+    batch_size, time_steps, _ = interval_query.shape
+    decoded: List[List[Tuple[int, int]]] = []
+    for batch_idx in range(batch_size):
+        query_single = interval_query[batch_idx].unsqueeze(1)  # [T, 1, D]
+        key_single = interval_key[batch_idx].unsqueeze(1)  # [T, 1, D]
+        diag_single = interval_diag[batch_idx].unsqueeze(1)  # [T, 1]
 
-    return {
-        "loss": consistency_loss,
-        "pair_count": total_pair_count / valid_batch_count,
-        "aligned_segments": total_aligned_segments / valid_batch_count,
-        "probability_cosine": total_probability_cosine / safe_segment_count,
-        "argmax_match": total_argmax_match / safe_segment_count,
-        "audio_similarity": total_audio_similarity / safe_pair_count,
-        "span_ratio": total_span_ratio / safe_pair_count,
-    }
+        score = _build_interval_score(
+            query_single,
+            key_single,
+            diag_single,
+            length_scaling=length_scaling,
+        )
+        semi_crf = NeuralSemiCRFInterval(
+            score,
+            _zero_noise_score(
+                time_steps,
+                batch_size=1,
+                device=score.device,
+            ),
+        )
+        decoded_batch = semi_crf.decode()
+        decoded.append(decoded_batch[0] if decoded_batch else [])
+    return decoded
 
 
 def compute_losses(
@@ -345,6 +433,9 @@ def compute_losses(
     batch: Dict[str, torch.Tensor],
     loss_cfg: Dict,
     root_chord_loss_fn: Optional[nn.Module] = None,
+    *,
+    chord_interval_length_scaling: str = "sqrt",
+    chord_interval_threshold: float = 0.8,
 ) -> Dict[str, torch.Tensor]:
     """モデル出力とバッチから、各タスクの損失を計算して辞書で返します。"""
     ce_ignore_index = loss_cfg.get("ce_ignore_index", -100)
@@ -360,7 +451,6 @@ def compute_losses(
         ignore_index=ce_ignore_index,
         label_smoothing=key_label_smoothing,
     )
-    ftl_cfg = loss_cfg.get("focal_tversky", {})
     stage = "initial"
 
     # Root-chord
@@ -441,54 +531,63 @@ def compute_losses(
         )
         all_losses[f"{stage}/downbeat"] = loss * weights.get("downbeat", 1.0)
 
-    # --- Chord25 タスク (Standard) ---
-    if f"{stage}_chord25_logits" in outputs:
-        loss = focal_tversky_loss(
-            y_true=batch["chord25"],
-            y_pred_logits=outputs[f"{stage}_chord25_logits"],
-            alpha=ftl_cfg.get("alpha", 0.3),
-            gamma=ftl_cfg.get("gamma", 1.5),
+    # --- Pitch Chroma (per-pitch on/off) ---
+    if "pitch_chroma_logits" in outputs and "chord25" in batch:
+        loss = F.binary_cross_entropy_with_logits(
+            outputs["pitch_chroma_logits"],
+            batch["chord25"][..., :12],  # [B, T, 12] — ピッチ部分のみ
         )
-        all_losses[f"{stage}/chord25"] = loss * weights.get("chord25", 1.0)
+        all_losses["pitch_chroma"] = loss * weights.get("pitch_chroma", 5.0)
 
-    # --- BiLSTM 深層監視 (Tversky) ---
-    # bilstm_intermediates: List[(B, T, chord_dim)] 各イテレーション後の出力
-    if "bilstm_intermediates" in outputs and "chord25" in batch:
-        bilstm_weight = weights.get("bilstm_chord25", 0.5)
-        for i, intermediate in enumerate(outputs["bilstm_intermediates"]):
-            loss = focal_tversky_loss(
-                y_true=batch["chord25"],
-                y_pred_logits=intermediate[..., :25],
-                alpha=ftl_cfg.get("alpha", 0.3),
-                gamma=ftl_cfg.get("gamma", 1.5),
+    # --- GT 区間プーリング分類ロス (Segment-level Classification) ---
+    segment_weight = weights.get("segment_classifier", 0.0)
+    if segment_weight > 0.0 and "boundary" in batch:
+        gt_intervals = extract_chord_intervals_from_boundary(batch["boundary"], threshold=chord_interval_threshold)
+
+        # Root-chord segment loss
+        if f"{stage}_root_chord_logits" in outputs and "root_chord_index" in batch:
+            loss = compute_segment_classification_loss(
+                logits=outputs[f"{stage}_root_chord_logits"],
+                labels=batch["root_chord_index"],
+                gt_intervals=gt_intervals,
+                loss_fn=root_chord_loss_fn if root_chord_loss_fn is not None else ce_loss_fn,
+                ignore_index=ce_ignore_index,
             )
-            all_losses[f"bilstm/chord25_iter{i}"] = loss * bilstm_weight
+            all_losses[f"{stage}/segment_root_chord"] = loss * segment_weight * weights.get("root_chord", 1.0)
 
-    repeat_ssm_output = outputs.get("repeat_ssm_output")
-    if repeat_ssm_output is not None:
-        repeat_sample_mask = _resolve_repeat_sample_mask(
-            batch,
-            batch_size=repeat_ssm_output.repeat_pair_counts.shape[0],
-            device=repeat_ssm_output.repeat_pair_counts.device,
+        # Bass segment loss
+        if f"{stage}_bass_logits" in outputs and "bass_index" in batch:
+            loss = compute_segment_classification_loss(
+                logits=outputs[f"{stage}_bass_logits"],
+                labels=batch["bass_index"],
+                gt_intervals=gt_intervals,
+                loss_fn=ce_loss_fn,
+                ignore_index=ce_ignore_index,
+            )
+            all_losses[f"{stage}/segment_bass"] = loss * segment_weight * weights.get("bass", 1.0)
+
+        # Key segment loss
+        if f"{stage}_key_logits" in outputs and "key_index" in batch:
+            loss = compute_segment_classification_loss(
+                logits=outputs[f"{stage}_key_logits"],
+                labels=batch["key_index"],
+                gt_intervals=gt_intervals,
+                loss_fn=key_ce_loss_fn,
+                ignore_index=ce_ignore_index,
+            )
+            all_losses[f"{stage}/segment_key"] = loss * segment_weight * weights.get("key", 1.0)
+
+    # --- Chord Interval (Semi-CRF) ---
+    if "interval_query" in outputs and "boundary" in batch:
+        chord_interval_loss, num_intervals = compute_chord_interval_loss(
+            interval_query=outputs["interval_query"],
+            interval_key=outputs["interval_key"],
+            interval_diag=outputs["interval_diag"],
+            boundary=batch["boundary"],
+            length_scaling=chord_interval_length_scaling,
+            boundary_threshold=chord_interval_threshold,
         )
-        if f"{stage}_root_chord_logits" in outputs:
-            repeat_root_stats = _compute_repeat_prediction_stats(
-                outputs[f"{stage}_root_chord_logits"],
-                repeat_ssm_output,
-                sample_mask=repeat_sample_mask,
-            )
-            all_losses[f"{stage}/repeat_root_consistency"] = repeat_root_stats["loss"] * weights.get(
-                "repeat_root_consistency", 0.0
-            )
-        if f"{stage}_bass_logits" in outputs:
-            repeat_bass_stats = _compute_repeat_prediction_stats(
-                outputs[f"{stage}_bass_logits"],
-                repeat_ssm_output,
-                sample_mask=repeat_sample_mask,
-            )
-            all_losses[f"{stage}/repeat_bass_consistency"] = repeat_bass_stats["loss"] * weights.get(
-                "repeat_bass_consistency", 0.0
-            )
+        all_losses["chord_interval/nll"] = chord_interval_loss * weights.get("chord_interval", 1.0)
 
     return all_losses
 
@@ -504,7 +603,12 @@ def _try_resolve_head(
 
 
 def compute_metrics(
-    outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], ce_ignore_index: int
+    outputs: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    ce_ignore_index: int,
+    *,
+    chord_interval_length_scaling: str = "sqrt",
+    chord_interval_iou_threshold: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
     """
     モデル出力とバッチから、各タスクのメトリクス（精度など）を計算します。
@@ -534,43 +638,20 @@ def compute_metrics(
     if logits is not None and "key_index" in batch:
         metrics["acc/key"] = accuracy_ignore_index_with_logits(logits, batch["key_index"], ce_ignore_index)
 
-    repeat_ssm_output = outputs.get("repeat_ssm_output")
-    if repeat_ssm_output is not None:
-        repeat_sample_mask = _resolve_repeat_sample_mask(
-            batch,
-            batch_size=repeat_ssm_output.repeat_pair_counts.shape[0],
-            device=repeat_ssm_output.repeat_pair_counts.device,
+    if "interval_query" in outputs and "interval_key" in outputs and "interval_diag" in outputs and "boundary" in batch:
+        gt_intervals = extract_chord_intervals_from_boundary(batch["boundary"])
+        pred_intervals = decode_chord_intervals(
+            outputs["interval_query"],
+            outputs["interval_key"],
+            outputs["interval_diag"],
+            length_scaling=chord_interval_length_scaling,
         )
-        valid_sample_count = repeat_sample_mask.to(dtype=torch.float32).sum().clamp_min(1.0)
-        metrics["repeat/pair_count"] = (
-            repeat_ssm_output.repeat_pair_counts[repeat_sample_mask].to(dtype=torch.float32).sum() / valid_sample_count
+        segment_macro_f1 = segment_macro_f1_score(
+            gt_intervals,
+            pred_intervals,
+            iou_threshold=chord_interval_iou_threshold,
+            inclusive_end=True,
         )
-        pair_similarity = getattr(repeat_ssm_output, "repeat_pairs_similarity", None)
-        max_pairs = repeat_ssm_output.repeat_pairs_lengths.shape[1]
-        pair_indices = torch.arange(max_pairs, device=repeat_ssm_output.repeat_pair_counts.device)
-        valid_pair_mask = pair_indices.unsqueeze(0) < repeat_ssm_output.repeat_pair_counts.unsqueeze(1)
-        valid_pair_mask &= repeat_sample_mask.unsqueeze(1)
-        if bool(valid_pair_mask.any().item()):
-            if pair_similarity is not None:
-                metrics["repeat/audio_similarity"] = pair_similarity[valid_pair_mask].mean()
-            metrics["repeat/span_ratio"] = repeat_ssm_output.repeat_pairs_span_ratio[valid_pair_mask].mean()
-        else:
-            zero = repeat_ssm_output.repeat_pairs_span_ratio.new_zeros(())
-            if pair_similarity is not None:
-                metrics["repeat/audio_similarity"] = zero
-            metrics["repeat/span_ratio"] = zero
-
-        logits = _try_resolve_head(outputs, "root_chord_logits")
-        if logits is not None:
-            root_stats = _compute_repeat_prediction_stats(logits, repeat_ssm_output, sample_mask=repeat_sample_mask)
-            metrics["repeat/root_prob_cosine"] = root_stats["probability_cosine"]
-            metrics["repeat/root_argmax_match"] = root_stats["argmax_match"]
-            metrics["repeat/aligned_segments"] = root_stats["aligned_segments"]
-
-        logits = _try_resolve_head(outputs, "bass_logits")
-        if logits is not None:
-            bass_stats = _compute_repeat_prediction_stats(logits, repeat_ssm_output, sample_mask=repeat_sample_mask)
-            metrics["repeat/bass_prob_cosine"] = bass_stats["probability_cosine"]
-            metrics["repeat/bass_argmax_match"] = bass_stats["argmax_match"]
+        metrics["segment/chord_macro_f1_iou_50"] = outputs["interval_query"].new_tensor(segment_macro_f1)
 
     return metrics

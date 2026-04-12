@@ -65,9 +65,7 @@ def main() -> None:
     print(f"リサンプリング対象: {len(targets)} ファイル (sample_rate -> {args.resample_rate})")
 
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        future_to_path = {
-            executor.submit(resample_in_place, path, args.resample_rate): path for path in targets
-        }
+        future_to_path = {executor.submit(resample_in_place, path, args.resample_rate): path for path in targets}
         for future in as_completed(future_to_path):
             path = future_to_path[future]
             updated: bool | None = None

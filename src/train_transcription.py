@@ -201,7 +201,7 @@ def main():
     }
 
     # TensorBoard の出力先命名は実験入口で決める。
-    log_dir = Path(config["data"]["log_dir"]) / f'{config["experiment"]["name"]}_{time.strftime("%Y%m%d-%H%M%S")}'
+    log_dir = Path(config["data"]["log_dir"]) / f"{config['experiment']['name']}_{time.strftime('%Y%m%d-%H%M%S')}"
     writer = SummaryWriter(log_dir=str(log_dir))
     print(f"TensorBoard logs will be saved to: {log_dir}")
 

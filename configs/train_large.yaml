@@ -90,20 +90,24 @@ model:
     n_fft: 2048
     base_ch: 16
     hidden_size: 256
-    band_merge_hidden_size: 32
-    num_layers: 3
+    num_layers: 6
+    num_interval_queries: 4
     dropout: 0.25
     # 精度向上にかなり寄与するが、強度が強すぎると学習が停滞する
     spec_augment_params:
-        freq_mask_param: 15
+        freq_mask_param: 6
         time_mask_param: 40
-        num_freq_masks: 1
+        num_freq_masks: 4
         num_time_masks: 2
         p: 0.9
   classifier:
     hidden_size: 512              # BaseTranscriptionModel の H
     dropout_probability: 0.1
     use_layer_norm: true
+    chord_interval:
+      enabled: true
+      interval_dim: 32
+      length_scaling: "sqrt"
 
   # ルート/ベース/キー/クオリティのクラス数
   num_root_classes: 13
@@ -117,14 +121,9 @@ base_model_training:
   segment_seconds: 60.0
   batch_size: 4
   grad_accum_steps: 4
-  repeat_ssm:
-    enabled: true
-    enable_from_epoch: 80
-    window_size: 3
-    max_span_ratio: 1.3
 
   batch_cutmix:
-    enabled: true
+    enabled: false
     p: 0.1
     fade_seconds: 0.05
 
@@ -157,7 +156,7 @@ base_model_training:
     downbeat_tolerance: 1
     key_boundary_pos_weight: 40.0
     key_boundary_tolerance: 10
-    balanced_softmax_tau: 0.1
+    balanced_softmax_tau: 0.3
     focal_tversky:
       alpha: 0.3                    # Tversky index の alpha
       gamma: 1.5                   # Focal Tversky Loss の gamma
@@ -169,18 +168,16 @@ base_model_training:
       boundary: 3.0
       beat: 1.0
       downbeat: 1.0
-      chord25: 10.0
       key_boundary: 3.0
-      bilstm_chord25: 5.0           # IterativeBiLSTM 深層監視（各イテレーション）
-      repeat_root_consistency: 1.0
-      repeat_bass_consistency: 1.0
+      chord_interval: 0.1           # Semi-CRF コード区間 NLL
+      pitch_chroma: 10.0              # Pitch Chroma (12-class on/off)
+      segment_classifier: 0.1       # GT区間プーリングによる分類Loss
 
 crf_training:
   epochs: 100
   segment_seconds: 20.0
   batch_size: 4
   grad_accum_steps: 4
-
   batch_cutmix:
     enabled: true
     p: 0.1

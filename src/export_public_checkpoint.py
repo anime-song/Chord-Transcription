@@ -86,9 +86,7 @@ def _verify_checkpoint(checkpoint_path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Export an inference-only checkpoint with just weights and metadata."
-    )
+    parser = argparse.ArgumentParser(description="Export an inference-only checkpoint with just weights and metadata.")
     parser.add_argument(
         "--input",
         type=str,

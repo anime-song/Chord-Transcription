@@ -7,7 +7,7 @@ line-length = 120
 
 [project]
 name = "chord-transcription"
-version = "0.0.2"
+version = "0.0.3"
 description = "chord transcription model"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,8 +18,11 @@ dependencies = [
     "numpy>=1.24",
     "pytorch-crf>=0.7",
     "scipy>=1.10",
+    "soundfile>=0.12",
     "torch>=2.2",
     "torchaudio>=2.2",
+    "dlchordx>=1.0.5",
+    "torchcodec",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +32,6 @@ romanize = [
 train = [
     "audiomentations",
     "pyyaml>=6.0",
-    "soundfile>=0.12",
     "tensorboard>=2.16",
     "tqdm>=4.66",
 ]

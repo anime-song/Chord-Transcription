@@ -12,9 +12,9 @@ except ImportError:
 
 from .losses import compute_losses, compute_metrics
 from .augmentations import apply_batch_cutmix, apply_batch_time_stretch, apply_batch_waveform_augmentation
+from .visualization import save_semi_crf_visualization, save_pitch_chroma_visualization
 from ..data.audio_augmentation import StereoWaveformAugmentation
 from ..chord_transcription.models.factory import save_model_build_config_sidecar
-from ..chord_transcription.models.repeat_ssm import RepeatPairBuilderCPU
 
 
 class ModelEma(torch.nn.Module):
@@ -30,7 +30,9 @@ class ModelEma(torch.nn.Module):
 
     def _update(self, model, update_fn):
         with torch.no_grad():
-            for ema_v, model_v in zip(self.module.state_dict().values(), model.state_dict().values()):
+            ema_state = self.module.state_dict()
+            model_state = model.state_dict()
+            for ema_v, model_v in zip(ema_state.values(), model_state.values()):
                 if self.device is not None:
                     model_v = model_v.to(device=self.device)
                 ema_v.copy_(update_fn(ema_v, model_v))
@@ -82,6 +84,12 @@ class Trainer:
         self.ce_ignore_index = int(self.loss_cfg.get("ce_ignore_index", -100))
         self.root_chord_loss_fn = root_chord_loss_fn
 
+        chord_interval_cfg = self.config.get("model", {}).get("classifier", {}).get("chord_interval", {})
+        self.chord_interval_length_scaling = (
+            chord_interval_cfg.get("length_scaling", "sqrt") if isinstance(chord_interval_cfg, dict) else "sqrt"
+        )
+        self.chord_interval_threshold = float(self.loss_cfg.get("chord_interval_threshold", 0.8))
+
         self.global_step = 0
         self.start_epoch = 1
         self.validate_every = self.train_cfg.get("validate_every_n_epochs", 1)
@@ -94,10 +102,6 @@ class Trainer:
 
         self.ema = ModelEma(self.model, decay=0.99, device=self.device)
         self.device_waveform_augmentation: Optional[StereoWaveformAugmentation] = None
-        self.repeat_pair_builder: Optional[RepeatPairBuilderCPU] = None
-        self.repeat_enable_from_epoch = 1
-        self._last_label_head_detach: Optional[bool] = None
-        self.num_bass_classes = int(self.config.get("model", {}).get("num_bass_classes", 13))
 
         loader_cfg = self.config.get("data_loader", {})
         waveform_aug_cfg = loader_cfg.get("waveform_augmentation", {}) or {}
@@ -110,91 +114,6 @@ class Trainer:
                 config=waveform_aug_cfg,
             )
             print(f"{self.device_waveform_augmentation.summary()} [cuda mix]")
-        self._build_repeat_modules()
-
-    def _build_repeat_modules(self) -> None:
-        repeat_cfg = self.train_cfg.get("repeat_ssm", {}) or {}
-        if not bool(repeat_cfg.get("enabled", False)):
-            return
-        self.repeat_enable_from_epoch = int(repeat_cfg.get("enable_from_epoch", 1))
-        if self.repeat_enable_from_epoch < 1:
-            raise ValueError("repeat_ssm.enable_from_epoch must be >= 1")
-
-        self.repeat_pair_builder = RepeatPairBuilderCPU(
-            window_size=int(repeat_cfg.get("window_size", 4)),
-            max_span_ratio=float(repeat_cfg.get("max_span_ratio", 1.5)),
-            ignore_index=int(repeat_cfg.get("ignore_index", -100)),
-        )
-        self.repeat_pair_builder.eval()
-        if self.repeat_enable_from_epoch > 1:
-            print(f"Repeat SSM will be enabled from epoch {self.repeat_enable_from_epoch}.")
-
-    def _is_repeat_ssm_active(self, epoch: Optional[int]) -> bool:
-        if self.repeat_pair_builder is None:
-            return False
-        if epoch is None:
-            return True
-        return int(epoch) >= self.repeat_enable_from_epoch
-
-    def _iter_label_head_detach_targets(self):
-        seen = set()
-        for module in (self.model, self.ema.module):
-            current = module
-            while current is not None:
-                module_id = id(current)
-                if module_id in seen:
-                    break
-                seen.add(module_id)
-                if hasattr(current, "set_label_head_detach"):
-                    yield current
-                    break
-                current = getattr(current, "base_model", None)
-
-    def _update_label_head_detach_state(self, epoch: Optional[int]) -> None:
-        detach_enabled = not self._is_repeat_ssm_active(epoch)
-        if self._last_label_head_detach is not None and self._last_label_head_detach == detach_enabled:
-            return
-        for module in self._iter_label_head_detach_targets():
-            module.set_label_head_detach(detach_enabled)
-        self._last_label_head_detach = detach_enabled
-
-    def _combine_repeat_chord_labels(
-        self,
-        root_chord_labels: torch.Tensor,
-        bass_labels: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.repeat_pair_builder is None:
-            raise RuntimeError("repeat_pair_builder is not initialized")
-        if root_chord_labels.shape != bass_labels.shape:
-            raise ValueError("repeat root_chord labels and bass labels must have the same shape")
-
-        ignore_index = self.repeat_pair_builder.ignore_index
-        combined = root_chord_labels.new_full(root_chord_labels.shape, ignore_index)
-        valid_mask = (root_chord_labels != ignore_index) & (bass_labels != ignore_index)
-        if not bool(valid_mask.any().item()):
-            return combined
-
-        combined[valid_mask] = root_chord_labels[valid_mask] * self.num_bass_classes + bass_labels[valid_mask]
-        return combined
-
-    @torch.no_grad()
-    def _compute_repeat_ssm_output(self, batch: Dict[str, torch.Tensor], epoch: Optional[int] = None):
-        if not self._is_repeat_ssm_active(epoch):
-            return None
-        if "root_chord_index" not in batch or "bass_index" not in batch:
-            return None
-
-        repeat_chord_labels = self._combine_repeat_chord_labels(batch["root_chord_index"], batch["bass_index"])
-        return self.repeat_pair_builder(repeat_chord_labels)
-
-    def _attach_repeat_ssm_output(
-        self,
-        outputs: Dict[str, Any],
-        repeat_ssm_output,
-    ) -> Dict[str, Any]:
-        if repeat_ssm_output is not None:
-            outputs["repeat_ssm_output"] = repeat_ssm_output
-        return outputs
 
     def _filter_state_dict(
         self,
@@ -252,7 +171,6 @@ class Trainer:
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
         """1エポック分の学習処理。"""
         self.model.train()
-        self._update_label_head_detach_state(epoch)
         running_losses = {}
         usage_accum: Optional[torch.Tensor] = None
         usage_count = 0
@@ -284,16 +202,16 @@ class Trainer:
 
             # 2. バッチ単位の時間CutMix拡張 (長さが揃ったテンソルに対して適用)
             batch = apply_batch_cutmix(batch, batch_cutmix_cfg, sample_rate, hop_length)
-            repeat_ssm_output = self._compute_repeat_ssm_output(batch, epoch=epoch)
 
             with torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                 outputs = self.model(batch["audio"])
-                outputs = self._attach_repeat_ssm_output(outputs, repeat_ssm_output)
                 losses = compute_losses(
                     outputs,
                     batch,
                     self.loss_cfg,
                     root_chord_loss_fn=self.root_chord_loss_fn,
+                    chord_interval_length_scaling=self.chord_interval_length_scaling,
+                    chord_interval_threshold=self.chord_interval_threshold,
                 )
                 if losses:
                     supervised_total_loss = sum(losses.values())
@@ -358,27 +276,20 @@ class Trainer:
     def _validate_epoch(self, epoch: int) -> Dict[str, float]:
         """1エポック分の検証処理。"""
         self.model.eval()
-        self._update_label_head_detach_state(epoch)
         running_losses = {}
         running_ema_losses = {}
         running_metrics = {}
         running_ema = {}
-        usage_accum: Optional[torch.Tensor] = None
-        usage_count = 0
-
-        for batch in self.valid_loader:
+        for batch_idx, batch in enumerate(self.valid_loader):
             for key in batch:
                 batch[key] = batch[key].to(self.device)
 
             # 1. バッチ単位のタイムストレッチ (GPU上で長さを揃える)
             batch = apply_batch_time_stretch(batch)
-            repeat_ssm_output = self._compute_repeat_ssm_output(batch, epoch=epoch)
 
             with torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                 outputs = self.model(batch["audio"])
                 ema_outputs = self.ema.module(batch["audio"])
-                outputs = self._attach_repeat_ssm_output(outputs, repeat_ssm_output)
-                ema_outputs = self._attach_repeat_ssm_output(ema_outputs, repeat_ssm_output)
 
                 # ロス計算
                 losses = compute_losses(
@@ -386,6 +297,8 @@ class Trainer:
                     batch,
                     self.loss_cfg,
                     root_chord_loss_fn=self.root_chord_loss_fn,
+                    chord_interval_length_scaling=self.chord_interval_length_scaling,
+                    chord_interval_threshold=self.chord_interval_threshold,
                 )
                 for k, v in losses.items():
                     running_losses.setdefault(k, 0.0)
@@ -398,6 +311,8 @@ class Trainer:
                     batch,
                     self.loss_cfg,
                     root_chord_loss_fn=self.root_chord_loss_fn,
+                    chord_interval_length_scaling=self.chord_interval_length_scaling,
+                    chord_interval_threshold=self.chord_interval_threshold,
                 )
                 for k, v in ema_losses.items():
                     running_ema_losses.setdefault(f"ema_{k}", 0.0)
@@ -405,21 +320,42 @@ class Trainer:
                 running_ema_losses.setdefault("ema_total", 0.0)
                 running_ema_losses["ema_total"] += sum(v.item() for v in ema_losses.values())
 
-            usage = outputs.get("repeat/sec_type_usage")
-            if usage is not None:
-                usage = usage.detach().cpu()
-                if usage_accum is None:
-                    usage_accum = usage.clone()
-                else:
-                    usage_accum += usage
-                usage_count += 1
+            # 可視化 (最初のバッチのみ)
+            if batch_idx == 0:
+                output_dir = Path("debug/semi_crf_eval")
+                if "interval_query" in outputs and "boundary" in batch:
+                    save_semi_crf_visualization(
+                        interval_query=outputs["interval_query"],
+                        interval_key=outputs["interval_key"],
+                        interval_diag=outputs["interval_diag"],
+                        boundary=batch["boundary"],
+                        output_path=output_dir / f"epoch_{epoch:03d}.png",
+                        length_scaling=self.chord_interval_length_scaling,
+                        boundary_logits=outputs.get("initial_boundary_logits", outputs.get("boundary_logits")),
+                    )
+                if "pitch_chroma_logits" in outputs and "chord25" in batch:
+                    save_pitch_chroma_visualization(
+                        pitch_logits=outputs["pitch_chroma_logits"],
+                        chroma_target=batch["chord25"],
+                        output_path=output_dir / f"epoch_{epoch:03d}_pitch_chroma.png",
+                    )
 
-            metrics = compute_metrics(outputs, batch, self.ce_ignore_index)
+            metrics = compute_metrics(
+                outputs,
+                batch,
+                self.ce_ignore_index,
+                chord_interval_length_scaling=self.chord_interval_length_scaling,
+            )
             for k, v in metrics.items():
                 running_metrics.setdefault(k, 0.0)
                 running_metrics[k] += v.item()
 
-            metrics_ema = compute_metrics(ema_outputs, batch, self.ce_ignore_index)
+            metrics_ema = compute_metrics(
+                ema_outputs,
+                batch,
+                self.ce_ignore_index,
+                chord_interval_length_scaling=self.chord_interval_length_scaling,
+            )
             for k, v in metrics_ema.items():
                 running_ema.setdefault(f"ema_{k}", 0.0)
                 running_ema[f"ema_{k}"] += v.item()
@@ -431,10 +367,6 @@ class Trainer:
         epoch_results.update({k: v / denom for k, v in running_metrics.items()})
         epoch_results.update({k: v / denom for k, v in running_ema.items()})
 
-        if usage_accum is not None and usage_count > 0:
-            mean_usage = usage_accum / usage_count
-            for idx, value in enumerate(mean_usage.tolist()):
-                self.writer.add_scalar(f"Valid/section_type_usage/{idx}", value, epoch)
         return epoch_results
 
     def _save_checkpoint(self, epoch: int):

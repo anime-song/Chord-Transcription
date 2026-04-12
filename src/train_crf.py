@@ -120,7 +120,7 @@ def main():
         num_quality_classes=int(model_cfg["num_quality_classes"]),
         num_bass_classes=int(model_cfg["num_bass_classes"]),
         num_key_classes=int(model_cfg["num_key_classes"]),
-        chord25_dim=25,
+        pitch_chroma_dim=12,
     ).to(device)
 
     # Note: build_optimizer_and_scheduler filters for requires_grad=True
@@ -140,10 +140,9 @@ def main():
     bass_proj_ids = {id(p) for p in bass_proj_params}
 
     other_params = [
-        p for p in crf_model.parameters()
-        if p.requires_grad
-        and id(p) not in root_chord_proj_ids
-        and id(p) not in bass_proj_ids
+        p
+        for p in crf_model.parameters()
+        if p.requires_grad and id(p) not in root_chord_proj_ids and id(p) not in bass_proj_ids
     ]
 
     param_groups = [
@@ -156,13 +155,13 @@ def main():
         {
             "params": bass_proj_params,
             "lr": base_lr,
-            "weight_decay": base_wd * 10,   # 1e-3: 弱い正則化
+            "weight_decay": base_wd * 10,  # 1e-3: 弱い正則化
             "name": "bass_proj",
         },
         {
             "params": other_params,
             "lr": base_lr,
-            "weight_decay": base_wd,        # 1e-4: デフォルト
+            "weight_decay": base_wd,  # 1e-4: デフォルト
             "name": "others",
         },
     ]
@@ -180,9 +179,7 @@ def main():
     sch_cfg = config["crf_training"].get("scheduler", {})
     scheduler_type = sch_cfg.get("type", "none").lower()
     if scheduler_type == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=int(sch_cfg["cosine_tmax"])
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(sch_cfg["cosine_tmax"]))
     elif scheduler_type == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=int(sch_cfg["step_size"]), gamma=float(sch_cfg["gamma"])
@@ -198,7 +195,7 @@ def main():
     }
 
     # TensorBoard の出力先も実験入口で決める。
-    log_dir = Path(config["data"]["log_dir"]) / f'{config["experiment"]["name"]}_crf_{time.strftime("%Y%m%d-%H%M%S")}'
+    log_dir = Path(config["data"]["log_dir"]) / f"{config['experiment']['name']}_crf_{time.strftime('%Y%m%d-%H%M%S')}"
     writer = SummaryWriter(log_dir=str(log_dir))
     print(f"TensorBoard logs will be saved to: {log_dir}")
 

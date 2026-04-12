@@ -4,8 +4,36 @@
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/Chord-Transcription/blob/main/Chord_Transcription.ipynb)
 
-A repository for training chord transcription models.
-It enables high-precision inference through context interpretation using a **SegmentModel**.
+A repository for training high-precision chord transcription models.
+It leverages **CQT**, an **Axial RoFormer** architecture, and **Neural Semi-CRFs** to extract precise chord intervals and contextual relationships.
+
+## Architecture
+
+```mermaid
+graph TD
+    A[Audio Waveform] --> B(CQT Feature Extraction)
+    B --> C(Stem Convolution)
+    C --> D{Axial RoFormer<br>Time-Band Attention}
+    
+    Q1[Pitch Queries] --> D
+    Q2[Interval Queries] --> D
+    
+    D --> E1[Band Features]
+    D --> E2[Pitch Query Features]
+    D --> E3[Interval Query Features]
+    
+    E1 --> H1[Root / Bass / Key / Boundary Heads]
+    E2 --> H2[Chord25 Pitch On/Off Classification]
+    E3 --> H3[Semi-CRF Score Matrices]
+    
+    H3 --> CRF((Neural Semi-CRF))
+    CRF -->|decode| OUT[Chord Intervals]
+```
+
+The model architecture separates and specializes feature extraction:
+1. **Backbone**: Processes CQT features using Time-Band Axial RoFormer blocks.
+2. **Queries**: Specialized tokens for Pitch (25 types) and Interval scoring are concatenated and passed through the Transformer layers.
+3. **Semi-CRF**: Instead of independent frame-by-frame classification, a Neural Semi-CRF predicts the globally optimal sequence of chord intervals.
 
 # Dataset Creation Pipeline
 
@@ -111,19 +139,19 @@ uv run python -m src.preprocess.count_quality_freq --data_folder <data_folder> -
 
 # Training
 
-### Step 1. First-Stage Model Training
+### Step 1. Base Model Training
 
 ```bash
-uv run python -m src.train_transcription --config ./configs/train.yaml
+uv run python -m src.train_transcription --config ./configs/train_large.yaml
 
 ```
 
-### Step 2. Second-Stage Model Training (SegmentModel)
+### Step 2. CRF Model Training
 
-Specify the weights from the first-stage model in the checkpoint.
+Specify the weights from the base model in the checkpoint.
 
 ```bash
-uv run python -m src.train_segment_transcription --config ./configs/train.yaml --checkpoint <base_transcription.pt> --training_backbone
+uv run python -m src.train_crf --config ./configs/train_large.yaml --checkpoint <base_transcription.pt> --training_backbone
 
 ```
 
@@ -132,9 +160,10 @@ uv run python -m src.train_segment_transcription --config ./configs/train.yaml -
 ### Inference with a Base Model
 
 ```bash
-uv run python -m src.chord_transcription.inference --checkpoint <base_transcription.pt> --audio <audio_path> --decode hmm
+uv run python -m src.chord_transcription.inference --checkpoint <base_transcription.pt> --audio <audio_path> --decode crf_pool
 
 ```
+*Note: Available decode modes for the base model include `argmax`, `hmm`, and `crf_pool`.*
 
 ### Inference with a CRF Model
 
@@ -226,17 +255,17 @@ probe = nn.Linear(backbone.output_dim, num_labels).to(device)
 optimizer = torch.optim.AdamW(probe.parameters(), lr=1e-3)
 
 with torch.no_grad():
-    features, _ = backbone(waveform)  # features: [B, T, D]
+    backbone_out = backbone(waveform)
 
-logits = probe(features)  # example: frame-wise labeling
+# Example: frame-wise labeling using band features
+logits = probe(backbone_out.band_features)
 loss = criterion(logits.transpose(1, 2), target)
 loss.backward()
 optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 ```
 
-`Backbone.forward()` returns `(features, intermediates)`.
-`features` is the final frame-level representation, and `intermediates` contains per-block axial-transformer outputs that can be used for analysis or auxiliary losses.
+`Backbone.forward()` returns a `BackboneOutput` object containing `band_features`, `pitch_query_features`, and `interval_query_features` corresponding to the respective attention queries and features.
 
 # Pre-trained Models
 

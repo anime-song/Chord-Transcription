@@ -26,10 +26,6 @@ def apply_batch_cutmix(batch, config, sample_rate, hop_length):
         window_out, window_in = None, None
 
     B = batch["audio"].shape[0]
-    repeat_loss_mask = torch.ones((B,), dtype=torch.bool, device=device)
-    existing_repeat_loss_mask = batch.get("repeat_loss_mask")
-    if existing_repeat_loss_mask is not None:
-        repeat_loss_mask &= existing_repeat_loss_mask.bool()
 
     # 対象キーをリストアップ
     audio_key = "audio"
@@ -69,7 +65,6 @@ def apply_batch_cutmix(batch, config, sample_rate, hop_length):
 
         # ランダムにカット位置を選ぶ
         t_cut_frame = change_frames_A[random.randint(0, len(change_frames_A) - 1)].item()
-        repeat_loss_mask[idx_A] = False
 
         # フレームインデックスをオーディオサンプルインデックスに変換
         # hop_length * frame_index
@@ -121,7 +116,7 @@ def apply_batch_cutmix(batch, config, sample_rate, hop_length):
 
     # バッチを更新
     batch[audio_key] = mixed_audio
-    batch["repeat_loss_mask"] = repeat_loss_mask
+
     for k in frame_keys:
         if k in mixed_labels:
             batch[k] = mixed_labels[k]
